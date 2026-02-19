@@ -23,8 +23,10 @@ This crate now contains a forked runtime adapter (`wry_fork`) used by
 - Background color is applied at browser creation and reinforced on page loads.
 - Navigation veto handler (`navigation_handler`) and download handler callbacks are wired.
 - Cookies and clear-browsing-data operations are wired to CEF cookie/context APIs.
-- Some operations are still transitional (notably popup/new-window semantics,
-  custom protocol/resource interception, and some platform-specific APIs).
+- Popup/new-window handler mapping is available behind
+  `new-window-opener-optional` when used with a Tauri runtime where
+  `NewWindowFeatures` opener is optional.
+- Some operations are still transitional (notably some platform-specific APIs).
 
 ## Prerequisites
 
@@ -48,6 +50,9 @@ Add dependency:
 [dependencies]
 tauri-runtime-cef = { path = "../cef-rs/tauri-runtime-cef", features = ["tauri-runtime-adapter", "tao-runtime"] }
 ```
+
+If you are using a patched `tauri-runtime` with optional new-window opener
+support, also enable `new-window-opener-optional`.
 
 Then bootstrap CEF before launching Tauri, and use `CefRuntime` as your builder
 runtime type.

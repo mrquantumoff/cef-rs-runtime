@@ -1,5 +1,37 @@
 use crate::config::CefRuntimeConfig;
-use cef::{args::Args, execute_process, initialize, shutdown, App, CefString, ImplCommandLine};
+use crate::pump::{clear_external_message_pump_queue, install_external_message_pump_queue};
+use cef::external_message_pump::ExternalMessagePumpScheduleQueue;
+use cef::rc::Rc;
+use cef::{
+    args::Args, execute_process, initialize, shutdown, wrap_app, wrap_browser_process_handler, App,
+    BrowserProcessHandler, CefString, ImplApp, ImplBrowserProcessHandler, ImplCommandLine, WrapApp,
+    WrapBrowserProcessHandler,
+};
+use std::sync::Arc;
+
+wrap_browser_process_handler! {
+    struct RuntimeBootstrapBrowserProcessHandler {
+        queue: Arc<ExternalMessagePumpScheduleQueue>,
+    }
+
+    impl BrowserProcessHandler {
+        fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+            let _ = self.queue.push(delay_ms);
+        }
+    }
+}
+
+wrap_app! {
+    struct RuntimeBootstrapApp {
+        queue: Arc<ExternalMessagePumpScheduleQueue>,
+    }
+
+    impl App {
+        fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
+            Some(RuntimeBootstrapBrowserProcessHandler::new(self.queue.clone()))
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
@@ -59,10 +91,19 @@ pub fn bootstrap(
 }
 
 pub fn bootstrap_with_options(
-    app: Option<&mut App>,
+    mut app: Option<&mut App>,
     config: CefRuntimeConfig,
     options: BootstrapOptions,
 ) -> Result<BootstrapOutcome, BootstrapError> {
+    let mut internal_app = None;
+    if app.is_none() && config.external_message_pump {
+        let queue = Arc::new(ExternalMessagePumpScheduleQueue::new());
+        install_external_message_pump_queue(queue.clone());
+        internal_app = Some(RuntimeBootstrapApp::new(queue));
+    } else {
+        clear_external_message_pump_queue();
+    }
+
     let args = Args::new();
     let Some(command_line) = args.as_cmd_line() else {
         return Err(BootstrapError::InvalidCommandLine);
@@ -70,7 +111,15 @@ pub fn bootstrap_with_options(
 
     let switch = CefString::from("type");
     let is_browser_process = command_line.has_switch(Some(&switch)) != 1;
-    let ret = execute_process(Some(args.as_main_args()), None, options.sandbox_info);
+    let execute_process_app = match app.as_deref_mut() {
+        Some(app) => Some(app),
+        None => internal_app.as_mut(),
+    };
+    let ret = execute_process(
+        Some(args.as_main_args()),
+        execute_process_app,
+        options.sandbox_info,
+    );
 
     if !is_browser_process {
         if ret >= 0 {
@@ -84,13 +133,18 @@ pub fn bootstrap_with_options(
     }
 
     let settings = config.into_settings();
+    let initialize_app = match app.as_deref_mut() {
+        Some(app) => Some(app),
+        None => internal_app.as_mut(),
+    };
     if initialize(
         Some(args.as_main_args()),
         Some(&settings),
-        app,
+        initialize_app,
         options.sandbox_info,
     ) != 1
     {
+        clear_external_message_pump_queue();
         return Err(BootstrapError::InitializeFailed);
     }
 

@@ -1,14 +1,43 @@
 use crate::browser_slot::BrowserSlot;
 use cef::*;
-use std::{path::PathBuf, sync::Arc};
+use http::header::CONTENT_TYPE;
+use std::{
+    borrow::Cow,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 pub type BrowserEventHandler = Arc<dyn Fn(BrowserEvent) + Send + Sync + 'static>;
 pub type BeforeBrowseHandler = Arc<dyn Fn(&str) -> bool + Send + Sync + 'static>;
 pub type OpenUrlFromTabHandler = Arc<dyn Fn(&str) -> bool + Send + Sync + 'static>;
+pub type PopupRequestedHandler =
+    Arc<dyn Fn(&str, PopupRequestFeatures) -> bool + Send + Sync + 'static>;
+pub type ResourceRequestHandlerCallback = Arc<
+    dyn Fn(ResourceRequestPayload) -> Option<http::Response<Cow<'static, [u8]>>>
+        + Send
+        + Sync
+        + 'static,
+>;
 pub type DownloadRequestedHandler =
     Arc<dyn Fn(String, String) -> Option<PathBuf> + Send + Sync + 'static>;
 pub type DownloadFinishedHandler =
     Arc<dyn Fn(String, Option<PathBuf>, bool) + Send + Sync + 'static>;
+
+#[derive(Debug, Clone)]
+pub struct ResourceRequestPayload {
+    pub url: String,
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub is_navigation: bool,
+    pub is_download: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PopupRequestFeatures {
+    pub position: Option<(i32, i32)>,
+    pub size: Option<(i32, i32)>,
+}
 
 #[derive(Debug)]
 pub enum BrowserEvent {
@@ -50,6 +79,8 @@ pub struct RuntimeClientCallbacks {
     pub on_event: Option<BrowserEventHandler>,
     pub on_before_browse: Option<BeforeBrowseHandler>,
     pub on_open_url_from_tab: Option<OpenUrlFromTabHandler>,
+    pub on_popup_requested: Option<PopupRequestedHandler>,
+    pub on_resource_request: Option<ResourceRequestHandlerCallback>,
     pub on_download_requested: Option<DownloadRequestedHandler>,
     pub on_download_finished: Option<DownloadFinishedHandler>,
 }
@@ -116,6 +147,25 @@ impl RuntimeClientBuilder {
         self
     }
 
+    pub fn on_popup_requested<F>(mut self, on_popup_requested: F) -> Self
+    where
+        F: Fn(&str, PopupRequestFeatures) -> bool + Send + Sync + 'static,
+    {
+        self.callbacks.on_popup_requested = Some(Arc::new(on_popup_requested));
+        self
+    }
+
+    pub fn on_resource_request<F>(mut self, on_resource_request: F) -> Self
+    where
+        F: Fn(ResourceRequestPayload) -> Option<http::Response<Cow<'static, [u8]>>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.callbacks.on_resource_request = Some(Arc::new(on_resource_request));
+        self
+    }
+
     pub fn on_download_requested<F>(mut self, on_download_requested: F) -> Self
     where
         F: Fn(String, String) -> Option<PathBuf> + Send + Sync + 'static,
@@ -165,6 +215,200 @@ fn process_message_arguments(message: Option<&mut ProcessMessage>) -> Vec<String
     (0..arguments.size())
         .map(|index| to_string(arguments.string(index)))
         .collect()
+}
+
+fn request_headers(request: &Request) -> Vec<(String, String)> {
+    let mut header_map = CefStringMultimap::new();
+    request.header_map(Some(&mut header_map));
+
+    let mut headers = Vec::new();
+    for (name, values) in header_map {
+        for value in values {
+            headers.push((name.clone(), value));
+        }
+    }
+    headers
+}
+
+fn request_body(request: &Request) -> Vec<u8> {
+    let Some(post_data) = request.post_data() else {
+        return Vec::new();
+    };
+
+    let element_count = post_data.element_count();
+    if element_count == 0 {
+        return Vec::new();
+    }
+
+    let mut elements = vec![None; element_count];
+    post_data.elements(Some(&mut elements));
+
+    let mut body = Vec::new();
+    for element in elements.into_iter().flatten() {
+        if element.get_type() != PostdataelementType::BYTES {
+            continue;
+        }
+
+        let size = element.bytes_count();
+        if size == 0 {
+            continue;
+        }
+
+        let mut chunk = vec![0; size];
+        let read = element.bytes(size, chunk.as_mut_ptr());
+        chunk.truncate(read.min(size));
+        body.extend_from_slice(&chunk);
+    }
+
+    body
+}
+
+fn to_resource_request_payload(
+    request: Option<&mut Request>,
+    is_navigation: bool,
+    is_download: bool,
+) -> Option<ResourceRequestPayload> {
+    let request = request?;
+
+    Some(ResourceRequestPayload {
+        url: to_string(request.url()),
+        method: to_string(request.method()),
+        headers: request_headers(request),
+        body: request_body(request),
+        is_navigation,
+        is_download,
+    })
+}
+
+fn popup_request_features(features: Option<&PopupFeatures>) -> PopupRequestFeatures {
+    let Some(features) = features else {
+        return PopupRequestFeatures::default();
+    };
+
+    let position = (features.x_set != 0 && features.y_set != 0).then_some((features.x, features.y));
+    let size = (features.width_set != 0
+        && features.height_set != 0
+        && features.width > 0
+        && features.height > 0)
+        .then_some((features.width, features.height));
+
+    PopupRequestFeatures { position, size }
+}
+
+wrap_resource_handler! {
+    struct MemoryResourceHandler {
+        status: i32,
+        status_text: String,
+        mime_type: String,
+        headers: CefStringMultimap,
+        body: Arc<Vec<u8>>,
+        offset: Arc<Mutex<usize>>,
+    }
+
+    impl ResourceHandler {
+        fn open(
+            &self,
+            _request: Option<&mut Request>,
+            handle_request: Option<&mut i32>,
+            _callback: Option<&mut Callback>,
+        ) -> i32 {
+            if let Some(handle_request) = handle_request {
+                *handle_request = 1;
+            }
+            1
+        }
+
+        fn response_headers(
+            &self,
+            response: Option<&mut Response>,
+            response_length: Option<&mut i64>,
+            _redirect_url: Option<&mut CefString>,
+        ) {
+            let Some(response) = response else {
+                return;
+            };
+
+            response.set_status(self.status);
+            response.set_status_text(Some(&CefString::from(self.status_text.as_str())));
+            response.set_mime_type(Some(&CefString::from(self.mime_type.as_str())));
+
+            let mut headers = self.headers.clone();
+            response.set_header_map(Some(&mut headers));
+
+            if let Some(response_length) = response_length {
+                *response_length = self.body.len() as i64;
+            }
+        }
+
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        fn read(
+            &self,
+            data_out: *mut u8,
+            bytes_to_read: i32,
+            bytes_read: Option<&mut i32>,
+            _callback: Option<&mut ResourceReadCallback>,
+        ) -> i32 {
+            if bytes_to_read <= 0 {
+                return 0;
+            }
+
+            let Some(bytes_read) = bytes_read else {
+                return 0;
+            };
+
+            let Ok(mut offset) = self.offset.lock() else {
+                *bytes_read = 0;
+                return 0;
+            };
+
+            let remaining = self.body.len().saturating_sub(*offset);
+            let to_copy = remaining.min(bytes_to_read as usize);
+            if to_copy == 0 {
+                *bytes_read = 0;
+                return 0;
+            }
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.body.as_ptr().add(*offset), data_out, to_copy);
+            }
+            *offset += to_copy;
+            *bytes_read = to_copy as i32;
+            1
+        }
+    }
+}
+
+fn to_resource_handler(response: http::Response<Cow<'static, [u8]>>) -> Option<ResourceHandler> {
+    let (parts, body) = response.into_parts();
+
+    let mut header_map = CefStringMultimap::new();
+    for (name, value) in &parts.headers {
+        if let Ok(value) = value.to_str() {
+            let _ = header_map.append(name.as_str(), value);
+        }
+    }
+
+    let mime_type = parts
+        .headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    let status_text = parts.status.canonical_reason().unwrap_or("OK").to_string();
+    let status = i32::from(parts.status.as_u16());
+    let body = Arc::new(body.into_owned());
+
+    Some(MemoryResourceHandler::new(
+        status,
+        status_text,
+        mime_type,
+        header_map,
+        body,
+        Arc::new(Mutex::new(0)),
+    ))
 }
 
 wrap_client! {
@@ -252,12 +496,57 @@ wrap_request_handler! {
             _target_disposition: WindowOpenDisposition,
             _user_gesture: i32,
         ) -> i32 {
+            let url = target_url.map(CefString::to_string).unwrap_or_default();
+
+            if let Some(handler) = &self.state.callbacks.on_popup_requested {
+                return i32::from(!handler(&url, PopupRequestFeatures::default()));
+            }
+
             let Some(handler) = &self.state.callbacks.on_open_url_from_tab else {
                 return 0;
             };
 
-            let url = target_url.map(CefString::to_string).unwrap_or_default();
             i32::from(!handler(&url))
+        }
+
+        fn resource_request_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            is_navigation: i32,
+            is_download: i32,
+            _request_initiator: Option<&CefString>,
+            _disable_default_handling: Option<&mut i32>,
+        ) -> Option<cef::ResourceRequestHandler> {
+            self.state.callbacks.on_resource_request.as_ref()?;
+            Some(RuntimeResourceRequestHandler::new(
+                self.state.clone(),
+                is_navigation != 0,
+                is_download != 0,
+            ))
+        }
+    }
+}
+
+wrap_resource_request_handler! {
+    struct RuntimeResourceRequestHandler {
+        state: Arc<RuntimeClientState>,
+        is_navigation: bool,
+        is_download: bool,
+    }
+
+    impl ResourceRequestHandler {
+        fn resource_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+        ) -> Option<ResourceHandler> {
+            let handler = self.state.callbacks.on_resource_request.as_ref()?;
+            let request = to_resource_request_payload(request, self.is_navigation, self.is_download)?;
+            let response = handler(request)?;
+            to_resource_handler(response)
         }
     }
 }
@@ -362,6 +651,35 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: i32,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            _user_gesture: i32,
+            popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut i32>,
+        ) -> i32 {
+            let url = target_url.map(CefString::to_string).unwrap_or_default();
+
+            if let Some(handler) = &self.state.callbacks.on_popup_requested {
+                return i32::from(!handler(&url, popup_request_features(popup_features)));
+            }
+
+            let Some(handler) = &self.state.callbacks.on_open_url_from_tab else {
+                return 0;
+            };
+
+            i32::from(!handler(&url))
+        }
+
         fn on_after_created(&self, browser: Option<&mut cef::Browser>) {
             let Some(browser) = browser.cloned() else {
                 return;
