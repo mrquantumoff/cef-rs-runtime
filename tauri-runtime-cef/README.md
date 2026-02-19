@@ -21,8 +21,10 @@ This crate now contains a forked runtime adapter (`wry_fork`) used by
 - Linux/X11 child embedding path is implemented in the runtime fork.
 - Runtime compiles and tests pass.
 - Background color is applied at browser creation and reinforced on page loads.
-- Some operations are still transitional (notably cookie management and a few
-  browser-data APIs).
+- Navigation veto handler (`navigation_handler`) and download handler callbacks are wired.
+- Cookies and clear-browsing-data operations are wired to CEF cookie/context APIs.
+- Some operations are still transitional (notably popup/new-window semantics,
+  custom protocol/resource interception, and some platform-specific APIs).
 
 ## Prerequisites
 

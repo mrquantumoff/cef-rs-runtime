@@ -4,9 +4,9 @@
 
 # VIBE CODED TAURI RUNTIME FOR CEF-RS
 
-## This is a fork of Tauri's CEF-RS with the runtime vibe coded by GPT 5.3-Codex/Claude Opus 4.6.
+### This is a fork of Tauri's CEF-RS with the runtime vibe coded by GPT 5.3-Codex/Claude Opus 4.6.
 
-### I've forced them to provide a compatible API in order to try using my app with CEF on Linux. This code most likely is unstable af and can have a bunch of undiscovered security vulnerabilities. That said, it should work for CEF in Tauri.
+I've forced them to provide a compatible API in order to try using my app with CEF on Linux. This code most likely is unstable af and can have a bunch of undiscovered security vulnerabilities. That said, it should work for CEF in Tauri when I'm done vibe coding it.
 
 Use CEF in Rust.
 

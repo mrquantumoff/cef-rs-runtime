@@ -16,7 +16,7 @@ use tauri_runtime::{
   dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size},
   monitor::Monitor,
   webview::{
-    DetachedWebview, PageLoadEvent, PendingWebview,
+    DetachedWebview, DownloadEvent, PageLoadEvent, PendingWebview,
   },
   window::{
     CursorIcon, DetachedWindow, DetachedWindowWebview, DragDropEvent, PendingWindow, RawWindow,
@@ -4261,6 +4261,7 @@ fn handle_event_loop<T: UserEvent>(
     }
 
     Event::MainEventsCleared => {
+      cef::do_message_loop_work();
       callback(RunEvent::MainEventsCleared);
     }
 
@@ -4772,8 +4773,10 @@ fn create_webview<T: UserEvent>(
     webview_attributes,
     ipc_handler,
     navigation_handler,
+    new_window_handler,
     document_title_changed_handler,
     on_page_load_handler,
+    download_handler,
     ..
   } = pending;
 
@@ -4791,6 +4794,16 @@ fn create_webview<T: UserEvent>(
 
   let scale_factor = window.scale_factor();
   let default_size = window.inner_size();
+  let initialization_scripts = Arc::new(
+    webview_attributes
+      .initialization_scripts
+      .iter()
+      .map(|script| script.script.clone())
+      .collect::<Vec<_>>(),
+  );
+  let javascript_disabled = webview_attributes.javascript_disabled;
+  let focused = webview_attributes.focus;
+  let open_devtools = webview_attributes.devtools.unwrap_or(false);
   let initial_rect = if let Some(bounds) = webview_attributes.bounds {
     let bounds: RectWrapper = bounds.into();
     bounds.0
@@ -4804,6 +4817,9 @@ fn create_webview<T: UserEvent>(
   let title_handler = Arc::new(Mutex::new(document_title_changed_handler));
   let page_load_handler = Arc::new(Mutex::new(on_page_load_handler));
   let ipc_handler = Arc::new(Mutex::new(ipc_handler));
+  let navigation_handler = Arc::new(Mutex::new(navigation_handler));
+  let download_handler = download_handler.clone();
+  let new_window_handler_installed = new_window_handler.is_some();
   let background_color = Arc::new(Mutex::new(
     webview_attributes
       .background_color
@@ -4814,6 +4830,70 @@ fn create_webview<T: UserEvent>(
   let browser_slot = BrowserSlot::new();
   let mut client = RuntimeClientBuilder::new()
     .with_browser_slot(browser_slot.clone())
+    .on_before_browse({
+      let navigation_handler = navigation_handler.clone();
+      move |url| {
+        let Ok(parsed_url) = Url::parse(url) else {
+          return true;
+        };
+
+        if let Ok(handler) = navigation_handler.lock() {
+          if let Some(handler) = handler.as_ref() {
+            return handler(&parsed_url);
+          }
+        }
+
+        true
+      }
+    })
+    .on_open_url_from_tab(move |target_url| {
+      if new_window_handler_installed {
+        log::warn!(
+          "new_window_handler is set but CEF runtime does not yet support NewWindowFeatures; blocking popup: {target_url}"
+        );
+      }
+      false
+    })
+    .on_download_requested({
+      let download_handler = download_handler.clone();
+      move |url, suggested_name| {
+        let mut destination = std::env::temp_dir().join(suggested_name);
+
+        if let Some(handler) = &download_handler {
+          let parsed_url = Url::parse(&url).ok()?;
+          if !handler(DownloadEvent::Requested {
+            url: parsed_url,
+            destination: &mut destination,
+          }) {
+            return None;
+          }
+        }
+
+        if destination.is_relative() {
+          if let Ok(cwd) = std::env::current_dir() {
+            destination = cwd.join(destination);
+          }
+        }
+
+        Some(destination)
+      }
+    })
+    .on_download_finished({
+      let download_handler = download_handler.clone();
+      move |url, path, success| {
+        let Some(handler) = &download_handler else {
+          return;
+        };
+
+        if let Ok(parsed_url) = Url::parse(&url) {
+          let _ = handler(DownloadEvent::Finished {
+            url: parsed_url,
+            path,
+            success,
+          });
+        }
+      }
+    })
     .on_event({
       let context = context.clone();
       let window_id = window_id.clone();
@@ -4821,6 +4901,7 @@ fn create_webview<T: UserEvent>(
       let title_handler = title_handler.clone();
       let page_load_handler = page_load_handler.clone();
       let ipc_handler = ipc_handler.clone();
+      let initialization_scripts = initialization_scripts.clone();
       let background_color = background_color.clone();
       let browser_slot = browser_slot.clone();
       move |event| match event {
@@ -4842,6 +4923,10 @@ fn create_webview<T: UserEvent>(
 
           if let Ok(color) = background_color.lock() {
             let _ = apply_background_color(&browser_slot, *color);
+          }
+
+          for script in initialization_scripts.iter() {
+            let _ = browser_slot.eval(script);
           }
         }
         BrowserEvent::LoadFinished { url, .. } => {
@@ -4921,6 +5006,9 @@ fn create_webview<T: UserEvent>(
       if let Ok(color) = background_color.lock() {
         settings.background_color = rgba_to_cef_color(*color);
       }
+      if javascript_disabled {
+        settings.javascript = cef::State::DISABLED;
+      }
 
       let browser = browser_host_create_browser_sync(
         Some(&window_info),
@@ -4932,8 +5020,22 @@ fn create_webview<T: UserEvent>(
       );
 
       browser_slot.set(browser);
+      if !focused {
+        if let Some(browser) = browser_slot.current() {
+          if let Some(host) = browser.host() {
+            host.set_focus(0);
+          }
+        }
+      }
       if let Ok(color) = background_color.lock() {
         let _ = apply_background_color(&browser_slot, *color);
+      }
+      if open_devtools {
+        if let Some(browser) = browser_slot.current() {
+          if let Some(host) = browser.host() {
+            host.show_dev_tools(None, None, Some(&BrowserSettings::default()), None);
+          }
+        }
       }
     } else {
       log::warn!("failed to map tao window handle for CEF embedding");

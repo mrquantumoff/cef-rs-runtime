@@ -1,8 +1,14 @@
 use crate::browser_slot::BrowserSlot;
 use cef::*;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 pub type BrowserEventHandler = Arc<dyn Fn(BrowserEvent) + Send + Sync + 'static>;
+pub type BeforeBrowseHandler = Arc<dyn Fn(&str) -> bool + Send + Sync + 'static>;
+pub type OpenUrlFromTabHandler = Arc<dyn Fn(&str) -> bool + Send + Sync + 'static>;
+pub type DownloadRequestedHandler =
+    Arc<dyn Fn(String, String) -> Option<PathBuf> + Send + Sync + 'static>;
+pub type DownloadFinishedHandler =
+    Arc<dyn Fn(String, Option<PathBuf>, bool) + Send + Sync + 'static>;
 
 #[derive(Debug)]
 pub enum BrowserEvent {
@@ -42,6 +48,10 @@ pub enum BrowserEvent {
 #[derive(Clone, Default)]
 pub struct RuntimeClientCallbacks {
     pub on_event: Option<BrowserEventHandler>,
+    pub on_before_browse: Option<BeforeBrowseHandler>,
+    pub on_open_url_from_tab: Option<OpenUrlFromTabHandler>,
+    pub on_download_requested: Option<DownloadRequestedHandler>,
+    pub on_download_finished: Option<DownloadFinishedHandler>,
 }
 
 #[derive(Clone)]
@@ -90,6 +100,38 @@ impl RuntimeClientBuilder {
         self
     }
 
+    pub fn on_before_browse<F>(mut self, on_before_browse: F) -> Self
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        self.callbacks.on_before_browse = Some(Arc::new(on_before_browse));
+        self
+    }
+
+    pub fn on_open_url_from_tab<F>(mut self, on_open_url_from_tab: F) -> Self
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        self.callbacks.on_open_url_from_tab = Some(Arc::new(on_open_url_from_tab));
+        self
+    }
+
+    pub fn on_download_requested<F>(mut self, on_download_requested: F) -> Self
+    where
+        F: Fn(String, String) -> Option<PathBuf> + Send + Sync + 'static,
+    {
+        self.callbacks.on_download_requested = Some(Arc::new(on_download_requested));
+        self
+    }
+
+    pub fn on_download_finished<F>(mut self, on_download_finished: F) -> Self
+    where
+        F: Fn(String, Option<PathBuf>, bool) + Send + Sync + 'static,
+    {
+        self.callbacks.on_download_finished = Some(Arc::new(on_download_finished));
+        self
+    }
+
     pub fn build(self) -> Client {
         RuntimeClient::new(Arc::new(RuntimeClientState {
             browser_slot: self.browser_slot,
@@ -135,12 +177,20 @@ wrap_client! {
             Some(RuntimeDisplayHandler::new(self.state.clone()))
         }
 
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(RuntimeDownloadHandler::new(self.state.clone()))
+        }
+
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
             Some(RuntimeLifeSpanHandler::new(self.state.clone()))
         }
 
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(RuntimeLoadHandler::new(self.state.clone()))
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(RuntimeRequestHandler::new(self.state.clone()))
         }
 
         fn on_process_message_received(
@@ -168,6 +218,125 @@ wrap_client! {
             });
 
             0
+        }
+    }
+}
+
+wrap_request_handler! {
+    struct RuntimeRequestHandler {
+        state: Arc<RuntimeClientState>,
+    }
+
+    impl RequestHandler {
+        fn on_before_browse(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _user_gesture: i32,
+            _is_redirect: i32,
+        ) -> i32 {
+            let Some(handler) = &self.state.callbacks.on_before_browse else {
+                return 0;
+            };
+
+            let url = request.map_or_else(String::new, |request| to_string(request.url()));
+            i32::from(!handler(&url))
+        }
+
+        fn on_open_urlfrom_tab(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            target_url: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            _user_gesture: i32,
+        ) -> i32 {
+            let Some(handler) = &self.state.callbacks.on_open_url_from_tab else {
+                return 0;
+            };
+
+            let url = target_url.map(CefString::to_string).unwrap_or_default();
+            i32::from(!handler(&url))
+        }
+    }
+}
+
+wrap_download_handler! {
+    struct RuntimeDownloadHandler {
+        state: Arc<RuntimeClientState>,
+    }
+
+    impl DownloadHandler {
+        fn can_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _url: Option<&CefString>,
+            _request_method: Option<&CefString>,
+        ) -> i32 {
+            1
+        }
+
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> i32 {
+            let Some(callback) = callback else {
+                return 0;
+            };
+
+            let url = download_item
+                .as_ref()
+                .map_or_else(String::new, |item| to_string(item.url()));
+            let suggested_name = suggested_name
+                .map(CefString::to_string)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "download.bin".to_string());
+
+            let destination = if let Some(handler) = &self.state.callbacks.on_download_requested {
+                handler(url, suggested_name)
+            } else {
+                Some(std::env::temp_dir().join(suggested_name))
+            };
+
+            let Some(destination) = destination else {
+                return 0;
+            };
+
+            let destination = CefString::from(destination.to_string_lossy().as_ref());
+            callback.cont(Some(&destination), 0);
+            1
+        }
+
+        fn on_download_updated(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            _callback: Option<&mut DownloadItemCallback>,
+        ) {
+            let Some(handler) = &self.state.callbacks.on_download_finished else {
+                return;
+            };
+
+            let Some(download_item) = download_item else {
+                return;
+            };
+
+            if download_item.is_in_progress() != 0 {
+                return;
+            }
+
+            let url = to_string(download_item.url());
+            let full_path = to_string(download_item.full_path());
+            let path = (!full_path.is_empty()).then(|| PathBuf::from(full_path));
+            let success = download_item.is_complete() != 0
+                && download_item.is_canceled() == 0
+                && download_item.is_interrupted() == 0;
+
+            handler(url, path, success);
         }
     }
 }
