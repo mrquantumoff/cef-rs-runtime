@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod args;
+pub mod external_message_pump;
 pub mod rc;
 pub mod string;
 pub mod window_info;

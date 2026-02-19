@@ -8,6 +8,7 @@ members = [
     "export-cef-dir",
     "sys",
     "cef",
+    "tauri-runtime-cef",
     "examples/*",
 ]
 
