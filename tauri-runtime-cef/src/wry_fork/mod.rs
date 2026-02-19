@@ -4896,7 +4896,7 @@ fn create_webview<T: UserEvent>(
 ) -> Result<WebviewWrapper> {
     let PendingWebview {
         label,
-        mut url,
+        url,
         webview_attributes,
         uri_scheme_protocols,
         ipc_handler,
@@ -4908,14 +4908,6 @@ fn create_webview<T: UserEvent>(
         download_handler,
         ..
     } = pending;
-
-    if let Some(navigation_handler) = navigation_handler.as_ref() {
-        if let Ok(parsed_url) = Url::parse(&url) {
-            if !navigation_handler(&parsed_url) {
-                url = "about:blank".to_string();
-            }
-        }
-    }
 
     if !context.webview_runtime_installed {
         log::warn!("webview runtime is not marked as installed; continuing with CEF stub");
@@ -4932,6 +4924,7 @@ fn create_webview<T: UserEvent>(
     );
     let javascript_disabled = webview_attributes.javascript_disabled;
     let focused = webview_attributes.focus;
+    let drag_drop_handler_enabled = webview_attributes.drag_drop_handler_enabled;
     let open_devtools = webview_attributes.devtools.unwrap_or(false);
     let initial_rect = if let Some(bounds) = webview_attributes.bounds {
         let bounds: RectWrapper = bounds.into();
@@ -4966,6 +4959,7 @@ fn create_webview<T: UserEvent>(
     let browser_slot = BrowserSlot::new();
     let mut client = RuntimeClientBuilder::new()
         .with_browser_slot(browser_slot.clone())
+        .with_drag_drop_handler_enabled(drag_drop_handler_enabled)
         .on_before_browse({
             let navigation_handler = navigation_handler.clone();
             move |url| {
@@ -5136,6 +5130,7 @@ fn create_webview<T: UserEvent>(
             let initialization_scripts = initialization_scripts.clone();
             let background_color = background_color.clone();
             let browser_slot = browser_slot.clone();
+            let kind = kind;
             move |event| match event {
                 BrowserEvent::TitleChanged { title, .. } => {
                     if let Ok(handler) = title_handler.lock() {
@@ -5145,6 +5140,7 @@ fn create_webview<T: UserEvent>(
                     }
                 }
                 BrowserEvent::LoadStarted { url, .. } => {
+                    log::info!("cef load started: {}", url);
                     if let Ok(url) = Url::parse(&url) {
                         if let Ok(handler) = page_load_handler.lock() {
                             if let Some(handler) = handler.as_ref() {
@@ -5162,6 +5158,7 @@ fn create_webview<T: UserEvent>(
                     }
                 }
                 BrowserEvent::LoadFinished { url, .. } => {
+                    log::info!("cef load finished: {}", url);
                     if let Ok(url) = Url::parse(&url) {
                         if let Ok(handler) = page_load_handler.lock() {
                             if let Some(handler) = handler.as_ref() {
@@ -5206,6 +5203,26 @@ fn create_webview<T: UserEvent>(
                         }
                     }
                 }
+                BrowserEvent::DragEnter { files, .. } => {
+                    let event = DragDropEvent::Enter {
+                        paths: files.into_iter().map(PathBuf::from).collect(),
+                        position: PhysicalPosition::new(0.0, 0.0),
+                    };
+
+                    let message = if kind == WebviewKind::WindowContent {
+                        WebviewMessage::SynthesizedWindowEvent(SynthesizedWindowEvent::DragDrop(
+                            event,
+                        ))
+                    } else {
+                        WebviewMessage::WebviewEvent(WebviewEvent::DragDrop(event))
+                    };
+
+                    let _ = context.proxy.send_event(Message::Webview(
+                        *window_id.lock().unwrap(),
+                        id,
+                        message,
+                    ));
+                }
                 BrowserEvent::BeforeClose { .. } => {
                     let _ = context.proxy.send_event(Message::Webview(
                         *window_id.lock().unwrap(),
@@ -5220,59 +5237,102 @@ fn create_webview<T: UserEvent>(
 
     #[cfg(feature = "tao-runtime")]
     {
-        if let Ok(host_window) = HostWindowInfo::from_tao_window(window) {
-            let position = initial_rect.position.to_physical::<i32>(scale_factor);
-            let size = initial_rect.size.to_physical::<i32>(scale_factor);
-            let width = if size.width <= 0 { 800 } else { size.width };
-            let height = if size.height <= 0 { 600 } else { size.height };
+        let position = initial_rect.position.to_physical::<i32>(scale_factor);
+        let size = initial_rect.size.to_physical::<i32>(scale_factor);
+        let width = if size.width <= 0 { 800 } else { size.width };
+        let height = if size.height <= 0 { 600 } else { size.height };
 
-            let cef_bounds = CefRect {
-                x: position.x,
-                y: position.y,
-                width,
-                height,
-            };
-            let window_info =
-                WindowInfo::default().set_as_child(host_window.parent_handle, &cef_bounds);
-            let url = CefString::from(url.as_str());
-            let mut settings = BrowserSettings::default();
-            if let Ok(color) = background_color.lock() {
-                settings.background_color = rgba_to_cef_color(*color);
-            }
-            if javascript_disabled {
-                settings.javascript = cef::State::DISABLED;
-            }
+        let cef_bounds = CefRect {
+            x: position.x,
+            y: position.y,
+            width,
+            height,
+        };
+        let url = CefString::from(url.as_str());
+        let mut settings = BrowserSettings::default();
+        if let Ok(color) = background_color.lock() {
+            settings.background_color = rgba_to_cef_color(*color);
+        }
+        if javascript_disabled {
+            settings.javascript = cef::State::DISABLED;
+        }
 
-            let browser = browser_host_create_browser_sync(
-                Some(&window_info),
-                Some(&mut client),
-                Some(&url),
-                Some(&settings),
-                None,
-                None,
-            );
-
-            browser_slot.set(browser);
-            if !focused {
-                if let Some(browser) = browser_slot.current() {
-                    if let Some(host) = browser.host() {
-                        host.set_focus(0);
+        let mut browser = None;
+        let mut last_handle_error = None;
+        for attempt in 0..=30 {
+            match HostWindowInfo::from_tao_window(window) {
+                Ok(host_window) => {
+                    if host_window.parent_handle == 0 {
+                        last_handle_error = Some("got null parent window handle".to_string());
+                    } else {
+                        let window_info = WindowInfo::default()
+                            .set_as_child(host_window.parent_handle, &cef_bounds);
+                        browser = browser_host_create_browser_sync(
+                            Some(&window_info),
+                            Some(&mut client),
+                            Some(&url),
+                            Some(&settings),
+                            None,
+                            None,
+                        );
+                        if browser.is_some() {
+                            if attempt > 0 {
+                                log::warn!(
+                                    "CEF browser creation succeeded after retry {} (parent={:?})",
+                                    attempt,
+                                    host_window.parent_handle
+                                );
+                            }
+                            break;
+                        }
                     }
                 }
-            }
-            if let Ok(color) = background_color.lock() {
-                let _ = apply_background_color(&browser_slot, *color);
-            }
-            if open_devtools {
-                if let Some(browser) = browser_slot.current() {
-                    if let Some(host) = browser.host() {
-                        host.show_dev_tools(None, None, Some(&BrowserSettings::default()), None);
-                    }
+                Err(e) => {
+                    last_handle_error = Some(e.to_string());
                 }
             }
-        } else {
-            log::warn!("failed to map tao window handle for CEF embedding");
-            let _ = browser_slot.load_url(&url);
+
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        if browser.is_none() {
+            if let Some(reason) = last_handle_error {
+                log::error!(
+                    "CEF browser creation failed ({}; bounds={}x{}+{},{}). window will appear blank",
+                    reason,
+                    cef_bounds.width,
+                    cef_bounds.height,
+                    cef_bounds.x,
+                    cef_bounds.y,
+                );
+            } else {
+                log::error!(
+                    "CEF browser creation failed (bounds={}x{}+{},{}). window will appear blank",
+                    cef_bounds.width,
+                    cef_bounds.height,
+                    cef_bounds.x,
+                    cef_bounds.y,
+                );
+            }
+        }
+
+        browser_slot.set(browser);
+        if !focused {
+            if let Some(browser) = browser_slot.current() {
+                if let Some(host) = browser.host() {
+                    host.set_focus(0);
+                }
+            }
+        }
+        if let Ok(color) = background_color.lock() {
+            let _ = apply_background_color(&browser_slot, *color);
+        }
+        if open_devtools {
+            if let Some(browser) = browser_slot.current() {
+                if let Some(host) = browser.host() {
+                    host.show_dev_tools(None, None, Some(&BrowserSettings::default()), None);
+                }
+            }
         }
     }
 

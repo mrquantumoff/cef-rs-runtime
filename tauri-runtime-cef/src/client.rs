@@ -1,4 +1,5 @@
 use crate::browser_slot::BrowserSlot;
+use cef::string::CefStringList;
 use cef::*;
 use http::header::CONTENT_TYPE;
 use std::{
@@ -72,6 +73,32 @@ pub enum BrowserEvent {
         name: String,
         arguments: Vec<String>,
     },
+    JsDialog {
+        browser_id: i32,
+        origin_url: String,
+        dialog_type: u32,
+        message: String,
+        default_prompt: String,
+    },
+    BeforeUnloadDialog {
+        browser_id: i32,
+        message: String,
+        is_reload: bool,
+    },
+    FileDialog {
+        browser_id: i32,
+        mode: u32,
+        title: String,
+        default_file_path: String,
+        accept_filters: Vec<String>,
+        accept_extensions: Vec<String>,
+        accept_descriptions: Vec<String>,
+    },
+    DragEnter {
+        browser_id: i32,
+        files: Vec<String>,
+        mask: i32,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -83,6 +110,7 @@ pub struct RuntimeClientCallbacks {
     pub on_resource_request: Option<ResourceRequestHandlerCallback>,
     pub on_download_requested: Option<DownloadRequestedHandler>,
     pub on_download_finished: Option<DownloadFinishedHandler>,
+    pub drag_drop_handler_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -182,6 +210,11 @@ impl RuntimeClientBuilder {
         self
     }
 
+    pub fn with_drag_drop_handler_enabled(mut self, enabled: bool) -> Self {
+        self.callbacks.drag_drop_handler_enabled = enabled;
+        self
+    }
+
     pub fn build(self) -> Client {
         RuntimeClient::new(Arc::new(RuntimeClientState {
             browser_slot: self.browser_slot,
@@ -203,6 +236,16 @@ fn frame_url(frame: Option<&mut Frame>) -> String {
         return String::new();
     };
     to_string(frame.url())
+}
+
+fn cef_string(value: Option<&CefString>) -> String {
+    value.map(CefString::to_string).unwrap_or_default()
+}
+
+fn cef_string_list(value: Option<&mut CefStringList>) -> Vec<String> {
+    value
+        .map(|list| list.clone().into_iter().collect())
+        .unwrap_or_default()
 }
 
 fn process_message_arguments(message: Option<&mut ProcessMessage>) -> Vec<String> {
@@ -435,6 +478,26 @@ wrap_client! {
 
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(RuntimeRequestHandler::new(self.state.clone()))
+        }
+
+        fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
+            Some(RuntimeJsDialogHandler::new(self.state.clone()))
+        }
+
+        fn dialog_handler(&self) -> Option<DialogHandler> {
+            Some(RuntimeDialogHandler::new(self.state.clone()))
+        }
+
+        fn drag_handler(&self) -> Option<DragHandler> {
+            Some(RuntimeDragHandler::new(self.state.clone()))
+        }
+
+        fn focus_handler(&self) -> Option<FocusHandler> {
+            Some(RuntimeFocusHandler::new(self.state.clone()))
+        }
+
+        fn keyboard_handler(&self) -> Option<KeyboardHandler> {
+            Some(RuntimeKeyboardHandler::new(self.state.clone()))
         }
 
         fn on_process_message_received(
@@ -756,6 +819,176 @@ wrap_load_handler! {
                 url: frame_url(frame),
                 http_status_code,
             });
+        }
+    }
+}
+
+wrap_jsdialog_handler! {
+    struct RuntimeJsDialogHandler {
+        state: Arc<RuntimeClientState>,
+    }
+
+    impl JsdialogHandler {
+        fn on_jsdialog(
+            &self,
+            browser: Option<&mut Browser>,
+            origin_url: Option<&CefString>,
+            dialog_type: JsdialogType,
+            message_text: Option<&CefString>,
+            default_prompt_text: Option<&CefString>,
+            _callback: Option<&mut JsdialogCallback>,
+            _suppress_message: Option<&mut i32>,
+        ) -> i32 {
+            self.state.emit(BrowserEvent::JsDialog {
+                browser_id: browser_id(browser),
+                origin_url: cef_string(origin_url),
+                dialog_type: dialog_type.get_raw(),
+                message: cef_string(message_text),
+                default_prompt: cef_string(default_prompt_text),
+            });
+
+            0
+        }
+
+        fn on_before_unload_dialog(
+            &self,
+            browser: Option<&mut Browser>,
+            message_text: Option<&CefString>,
+            is_reload: i32,
+            _callback: Option<&mut JsdialogCallback>,
+        ) -> i32 {
+            self.state.emit(BrowserEvent::BeforeUnloadDialog {
+                browser_id: browser_id(browser),
+                message: cef_string(message_text),
+                is_reload: is_reload != 0,
+            });
+
+            0
+        }
+    }
+}
+
+wrap_dialog_handler! {
+    struct RuntimeDialogHandler {
+        state: Arc<RuntimeClientState>,
+    }
+
+    impl DialogHandler {
+        fn on_file_dialog(
+            &self,
+            browser: Option<&mut Browser>,
+            mode: FileDialogMode,
+            title: Option<&CefString>,
+            default_file_path: Option<&CefString>,
+            accept_filters: Option<&mut CefStringList>,
+            accept_extensions: Option<&mut CefStringList>,
+            accept_descriptions: Option<&mut CefStringList>,
+            _callback: Option<&mut FileDialogCallback>,
+        ) -> i32 {
+            self.state.emit(BrowserEvent::FileDialog {
+                browser_id: browser_id(browser),
+                mode: mode.get_raw(),
+                title: cef_string(title),
+                default_file_path: cef_string(default_file_path),
+                accept_filters: cef_string_list(accept_filters),
+                accept_extensions: cef_string_list(accept_extensions),
+                accept_descriptions: cef_string_list(accept_descriptions),
+            });
+
+            0
+        }
+    }
+}
+
+wrap_drag_handler! {
+    struct RuntimeDragHandler {
+        state: Arc<RuntimeClientState>,
+    }
+
+    impl DragHandler {
+        fn on_drag_enter(
+            &self,
+            browser: Option<&mut Browser>,
+            drag_data: Option<&mut DragData>,
+            mask: DragOperationsMask,
+        ) -> i32 {
+            if !self.state.callbacks.drag_drop_handler_enabled {
+                return 0;
+            }
+
+            let browser_id = browser_id(browser);
+            let mut files = Vec::new();
+            if let Some(drag_data) = drag_data {
+                let mut paths = CefStringList::new();
+                if drag_data.file_paths(Some(&mut paths)) != 0 {
+                    for i in paths {
+                        files.push(i);
+                    }
+                }
+            }
+
+            self.state.emit(BrowserEvent::DragEnter {
+                browser_id,
+                files,
+                mask: mask.as_ref().0 as i32,
+            });
+
+            0
+        }
+    }
+}
+
+wrap_focus_handler! {
+    struct RuntimeFocusHandler {
+        state: Arc<RuntimeClientState>,
+    }
+
+    impl FocusHandler {
+        fn on_take_focus(
+            &self,
+            _browser: Option<&mut Browser>,
+            _next: i32,
+        ) {}
+
+        fn on_set_focus(
+            &self,
+            _browser: Option<&mut Browser>,
+            _source: FocusSource,
+        ) -> i32 {
+            0
+        }
+
+        fn on_got_focus(
+            &self,
+            _browser: Option<&mut Browser>,
+        ) {
+        }
+    }
+}
+
+wrap_keyboard_handler! {
+    struct RuntimeKeyboardHandler {
+        state: Arc<RuntimeClientState>,
+    }
+
+    impl KeyboardHandler {
+        fn on_pre_key_event(
+            &self,
+            _browser: Option<&mut Browser>,
+            _event: Option<&KeyEvent>,
+            _os_event: Option<&mut cef::sys::XEvent>,
+            _is_keyboard_shortcut: Option<&mut i32>,
+        ) -> i32 {
+            0
+        }
+
+        fn on_key_event(
+            &self,
+            _browser: Option<&mut Browser>,
+            _event: Option<&KeyEvent>,
+            _os_event: Option<&mut cef::sys::XEvent>,
+        ) -> i32 {
+            0
         }
     }
 }

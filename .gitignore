@@ -9,3 +9,6 @@ Cargo.lock
 
 /.vscode/
 **/.DS_Store
+
+.gemini/
+gha-creds-*.json
