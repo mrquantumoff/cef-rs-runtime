@@ -5588,6 +5588,7 @@ const CEF_IPC_FALLBACK_SHIM: &str = r#"
 })();
 "#;
 
+
 #[derive(Debug, Clone)]
 struct WebviewBounds {
     x_rate: f32,
