@@ -5055,23 +5055,19 @@ fn handle_event_loop<T: UserEvent>(
                                 .filter_map(|wv| wv.browser_slot.current())
                                 .collect();
 
-                            // Update last cursor position (in logical/DIP pixels) before
-                            // dispatching to browsers. position from tao is physical.
+                            // Update last cursor position before dispatching to browsers.
+                            // tao emits CursorMoved as physical pixels on Linux
+                            // (LogicalPosition * scale_factor). CEF's SendMouseMoveEvent on
+                            // Linux expects device (physical) pixel coordinates relative to
+                            // the view — it applies device_scale_factor internally when
+                            // hit-testing. So we store and forward the raw physical coords.
                             if let TaoWindowEvent::CursorMoved { position, .. } = ev {
-                                // Read scale_factor from osr_state (already stored there).
-                                let sf = window
-                                    .webviews
-                                    .iter()
-                                    .find_map(|wv| wv.osr_state.as_ref())
-                                    .and_then(|s| s.lock().ok())
-                                    .map(|s| s.scale_factor as f64)
-                                    .unwrap_or(1.0);
-                                let lx = (position.x / sf).round() as i32;
-                                let ly = (position.y / sf).round() as i32;
+                                let px = position.x.round() as i32;
+                                let py = position.y.round() as i32;
                                 for webview in &window.webviews {
                                     if let Some(state_arc) = &webview.osr_state {
                                         if let Ok(mut state) = state_arc.lock() {
-                                            state.last_cursor = (lx, ly);
+                                            state.last_cursor = (px, py);
                                         }
                                     }
                                 }
@@ -5657,6 +5653,10 @@ fn create_webview<T: UserEvent>(
     > = new_window_handler.map(Arc::from);
     #[cfg(not(feature = "new-window-opener-optional"))]
     let has_new_window_handler = new_window_handler.is_some();
+    // Remember whether the caller provided an explicit background color.
+    // When no explicit color is given we skip the JS background-color injection
+    // (apply_background_color) so that the page's own CSS is not overridden.
+    let explicit_background_color = webview_attributes.background_color.is_some();
     let default_background = if webview_attributes.transparent {
         (0, 0, 0, 0)
     } else {
@@ -5876,8 +5876,14 @@ fn create_webview<T: UserEvent>(
                         }
                     }
 
-                    if let Ok(color) = background_color.lock() {
-                        let _ = apply_background_color(&browser_slot, *color);
+                    // Only inject a JS background color when the app explicitly
+                    // requested one.  Without this guard the default background
+                    // (black for OSR, white otherwise) would override the page's
+                    // own CSS background-color declarations.
+                    if explicit_background_color {
+                        if let Ok(color) = background_color.lock() {
+                            let _ = apply_background_color(&browser_slot, *color);
+                        }
                     }
 
                     if use_load_started_init_script_fallback {
@@ -5896,8 +5902,10 @@ fn create_webview<T: UserEvent>(
                         }
                     }
 
-                    if let Ok(color) = background_color.lock() {
-                        let _ = apply_background_color(&browser_slot, *color);
+                    if explicit_background_color {
+                        if let Ok(color) = background_color.lock() {
+                            let _ = apply_background_color(&browser_slot, *color);
+                        }
                     }
                 }
                 BrowserEvent::ProcessMessage {
@@ -6144,8 +6152,10 @@ fn create_webview<T: UserEvent>(
                 }
             }
         }
-        if let Ok(color) = background_color.lock() {
-            let _ = apply_background_color(&browser_slot, *color);
+        if explicit_background_color {
+            if let Ok(color) = background_color.lock() {
+                let _ = apply_background_color(&browser_slot, *color);
+            }
         }
         if open_devtools {
             if let Some(browser) = browser_slot.current() {
