@@ -871,8 +871,13 @@ impl WindowBuilder for WindowBuilderWrapper {
             target_os = "openbsd"
         ))]
         {
-            // Mouse event is disabled on Linux since sudden event bursts could block event loop.
-            window.inner = window.inner.with_cursor_moved_event(false);
+            // Mouse move events are disabled on Linux to prevent event-loop saturation.
+            // When the wayland-osr feature is active we need cursor moves to track the
+            // mouse position for CEF hit-testing, so we leave events enabled in that case.
+            #[cfg(not(feature = "wayland-osr"))]
+            {
+                window.inner = window.inner.with_cursor_moved_event(false);
+            }
         }
 
         #[cfg(desktop)]
@@ -4850,7 +4855,7 @@ fn handle_event_loop<T: UserEvent>(
                             if let Some(state_arc) = &webview.osr_state {
                                 if let Ok(mut state) = state_arc.lock() {
                                     if state.dirty {
-                                        let (w, h) = state.size;
+                                        let (w, h) = state.phys_size;
                                         osr_surface.present(&state.pixels, w, h);
                                         state.dirty = false;
                                     }
@@ -4997,10 +5002,12 @@ fn handle_event_loop<T: UserEvent>(
                                 #[cfg(feature = "wayland-osr")]
                                 if let Some(state_arc) = &webview.osr_state {
                                     // Update the OSR state size and notify CEF.
-                                    let phys = window.inner_size();
-                                    let w = phys.width as i32;
-                                    let h = phys.height as i32;
+                                    // view_rect is in logical (DIP) pixels.
                                     let sf = window.scale_factor();
+                                    let phys = window.inner_size();
+                                    let log: tao::dpi::LogicalSize<f64> = phys.to_logical(sf);
+                                    let w = log.width.round() as i32;
+                                    let h = log.height.round() as i32;
                                     if let Ok(mut state) = state_arc.lock() {
                                         state.resize(w, h, sf);
                                     }
@@ -5048,12 +5055,23 @@ fn handle_event_loop<T: UserEvent>(
                                 .filter_map(|wv| wv.browser_slot.current())
                                 .collect();
 
-                            // Update last cursor position before dispatching to browsers.
+                            // Update last cursor position (in logical/DIP pixels) before
+                            // dispatching to browsers. position from tao is physical.
                             if let TaoWindowEvent::CursorMoved { position, .. } = ev {
+                                // Read scale_factor from osr_state (already stored there).
+                                let sf = window
+                                    .webviews
+                                    .iter()
+                                    .find_map(|wv| wv.osr_state.as_ref())
+                                    .and_then(|s| s.lock().ok())
+                                    .map(|s| s.scale_factor as f64)
+                                    .unwrap_or(1.0);
+                                let lx = (position.x / sf).round() as i32;
+                                let ly = (position.y / sf).round() as i32;
                                 for webview in &window.webviews {
                                     if let Some(state_arc) = &webview.osr_state {
                                         if let Ok(mut state) = state_arc.lock() {
-                                            state.last_cursor = (position.x as i32, position.y as i32);
+                                            state.last_cursor = (lx, ly);
                                         }
                                     }
                                 }
@@ -5072,10 +5090,12 @@ fn handle_event_loop<T: UserEvent>(
                                     .unwrap_or((0, 0));
 
                                 match ev {
-                                    TaoWindowEvent::CursorMoved { position, .. } => {
+                                    TaoWindowEvent::CursorMoved { .. } => {
+                                        // CEF mouse coords are logical (DIP) pixels.
+                                        // cursor_pos was already converted from physical above.
                                         let me = cef::MouseEvent {
-                                            x: position.x as i32,
-                                            y: position.y as i32,
+                                            x: cursor_pos.0,
+                                            y: cursor_pos.1,
                                             modifiers: 0,
                                         };
                                         host.send_mouse_move_event(Some(&me), 0);
@@ -5640,7 +5660,13 @@ fn create_webview<T: UserEvent>(
     let default_background = if webview_attributes.transparent {
         (0, 0, 0, 0)
     } else {
-        (255, 255, 255, 255)
+        // For OSR on Wayland, default to black rather than white so there is no
+        // jarring white flash before the page content renders.  On other paths
+        // the conventional white default is preserved.
+        #[cfg(feature = "wayland-osr")]
+        { (0, 0, 0, 255) }
+        #[cfg(not(feature = "wayland-osr"))]
+        { (255, 255, 255, 255) }
     };
     let background_color = Arc::new(Mutex::new(
         webview_attributes
@@ -5964,9 +5990,12 @@ fn create_webview<T: UserEvent>(
     #[cfg(feature = "wayland-osr")]
     let (osr_state, mut client) = {
         if is_wayland {
-            let size = window.inner_size();
-            let w = size.width as i32;
-            let h = size.height as i32;
+            let scale_factor = window.scale_factor();
+            // view_rect must be in logical (DIP) pixels — divide physical by scale.
+            let phys = window.inner_size();
+            let log: tao::dpi::LogicalSize<f64> = phys.to_logical(scale_factor);
+            let w = log.width.round() as i32;
+            let h = log.height.round() as i32;
             let proxy_for_redraw = context.proxy.clone();
             let window_id_for_redraw = window_id.clone();
             let redraw_fn: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -5976,7 +6005,6 @@ fn create_webview<T: UserEvent>(
                 ));
             });
 
-            let scale_factor = window.scale_factor();
             let (render_handler, state) = OsrRenderHandler::build(w, h, scale_factor, redraw_fn);
             let client = client_builder
                 .with_osr_render_handler(render_handler)
