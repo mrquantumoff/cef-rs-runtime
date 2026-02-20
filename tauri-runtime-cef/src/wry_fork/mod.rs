@@ -579,7 +579,7 @@ fn tao_activation_policy(activation_policy: ActivationPolicy) -> TaoActivationPo
         ActivationPolicy::Regular => TaoActivationPolicy::Regular,
         ActivationPolicy::Accessory => TaoActivationPolicy::Accessory,
         ActivationPolicy::Prohibited => TaoActivationPolicy::Prohibited,
-        _ => unimplemented!(),
+        _ => TaoActivationPolicy::Regular,
     }
 }
 
@@ -2723,7 +2723,7 @@ fn resource_request_to_http_request(payload: &ResourceRequestPayload) -> Option<
 
 fn apply_cors_headers_for_custom_protocol(
     request: &ResourceRequestPayload,
-    protocol_name: &str,
+    _protocol_name: &str,
     response: &mut http::Response<Cow<'static, [u8]>>,
 ) {
     let headers = response.headers_mut();
@@ -2749,13 +2749,14 @@ fn apply_cors_headers_for_custom_protocol(
         );
     }
 
-    if protocol_name == "ipc" && !headers.contains_key(http::header::ACCESS_CONTROL_EXPOSE_HEADERS)
-    {
-        headers.insert(
-            http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
-            http::HeaderValue::from_static("Tauri-Response"),
-        );
-    }
+    // Always expose all response headers to JavaScript for custom protocol responses.
+    // CEF's Chromium engine applies standard CORS header filtering even for custom schemes,
+    // so without this wildcard, custom headers like `Tauri-Response` would not be visible
+    // in the JavaScript fetch Response.headers API.
+    headers.insert(
+        http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        http::HeaderValue::from_static("*"),
+    );
 }
 
 fn protocol_name_from_url(url: &Url) -> Option<String> {
@@ -2901,23 +2902,14 @@ fn apply_proxy_preference(context: &RequestContext, proxy_url: &Url) {
 fn create_request_context_for_webview(
     attributes: &tauri_runtime::webview::WebviewAttributes,
 ) -> Option<RequestContext> {
-    let mut should_create_context =
+    let should_create_context =
         attributes.incognito || attributes.user_agent.is_some() || attributes.proxy_url.is_some();
-    let mut settings = RequestContextSettings::default();
+    let settings = RequestContextSettings::default();
 
     if !attributes.incognito {
-        if let Some(data_directory) = attributes.data_directory.as_ref() {
-            should_create_context = true;
-            if let Err(error) = std::fs::create_dir_all(data_directory) {
-                log::warn!(
-                    "failed to create CEF data directory '{}': {error}",
-                    data_directory.display()
-                );
-            } else {
-                settings.cache_path = CefString::from(data_directory.to_string_lossy().as_ref());
-                settings.persist_session_cookies = 1;
-            }
-        }
+        // We do not create a separate RequestContext just for data_directory.
+        // Doing so conflicts with the global CEF cache path and causes "Cannot create profile" errors in the Chrome runtime.
+        // The global CEF cache_path should be configured during `bootstrap()` to point to the app data directory.
     }
 
     if !should_create_context {
@@ -5456,7 +5448,7 @@ fn create_webview<T: UserEvent>(
                         let protocol_name = protocol_name_from_url(&parsed_url);
                         if let Some(protocol_name) = protocol_name.as_deref() {
                             if protocol_name == "ipc" {
-                                log::debug!("handling ipc custom protocol request: {}", request_payload.url);
+                                log::debug!("handling ipc request: url={} method={} headers={:?}", request_payload.url, request_payload.method, request_payload.headers);
                             }
                             if let Some(protocol_handler) = protocols.get(protocol_name) {
                                 if let Some(request) = resource_request_to_http_request(&request_payload) {
@@ -5485,16 +5477,7 @@ fn create_webview<T: UserEvent>(
                                                 &mut response,
                                             );
 
-                                            if protocol_name == "ipc" {
-                                                let has_acao = response
-                                                    .headers()
-                                                    .contains_key(http::header::ACCESS_CONTROL_ALLOW_ORIGIN);
-                                                log::debug!(
-                                                    "ipc protocol response status={} acao={}",
-                                                    response.status(),
-                                                    has_acao
-                                                );
-                                            }
+
 
                                             return Some(response);
                                         }

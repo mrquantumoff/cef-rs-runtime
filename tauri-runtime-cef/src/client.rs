@@ -495,7 +495,22 @@ fn to_resource_handler(response: http::Response<Cow<'static, [u8]>>) -> Option<R
     let mut header_map = CefStringMultimap::new();
     for (name, value) in &parts.headers {
         if let Ok(value) = value.to_str() {
-            let _ = header_map.append(name.as_str(), value);
+            // Capitalize title: access-control-allow-origin -> Access-Control-Allow-Origin
+            let name_str = name.as_str();
+            let mut capitalized = String::with_capacity(name_str.len());
+            let mut capitalize_next = true;
+            for c in name_str.chars() {
+                if c == '-' {
+                    capitalized.push(c);
+                    capitalize_next = true;
+                } else if capitalize_next {
+                    capitalized.extend(c.to_uppercase());
+                    capitalize_next = false;
+                } else {
+                    capitalized.extend(c.to_lowercase());
+                }
+            }
+            let _ = header_map.append(&capitalized, value);
         }
     }
 
@@ -820,6 +835,30 @@ wrap_display_handler! {
                 browser_id: browser_id(browser),
                 title: title.map(CefString::to_string).unwrap_or_default(),
             });
+        }
+
+        fn on_console_message(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            level: cef::LogSeverity,
+            message: Option<&CefString>,
+            source: Option<&CefString>,
+            line: i32,
+        ) -> i32 {
+            let msg = message.map(CefString::to_string).unwrap_or_default();
+            let src = source.map(CefString::to_string).unwrap_or_default();
+            match level {
+                cef::LogSeverity::ERROR | cef::LogSeverity::FATAL => {
+                    log::error!("[CEF CONSOLE] {}:{} - {}", src, line, msg);
+                }
+                cef::LogSeverity::WARNING => {
+                    log::warn!("[CEF CONSOLE] {}:{} - {}", src, line, msg);
+                }
+                _ => {
+                    log::info!("[CEF CONSOLE] {}:{} - {}", src, line, msg);
+                }
+            }
+            0
         }
     }
 }
