@@ -9,7 +9,7 @@ pub mod wayland {
     use cef::rc::Rc;
     use cef::{
         wrap_render_handler, ImplRenderHandler, PaintElementType, Rect as CefRect, RenderHandler,
-        WrapRenderHandler,
+        ScreenInfo, WrapRenderHandler,
     };
     use softbuffer::{Context, Surface};
     use std::num::NonZeroU32;
@@ -23,27 +23,34 @@ pub mod wayland {
     /// State shared between the CEF render callback and the tao event loop.
     #[derive(Debug)]
     pub struct OsrState {
-        /// Current logical size (width × height in physical pixels).
+        /// Current size in physical pixels (what CEF renders at).
         pub size: (i32, i32),
+        /// HiDPI scale factor (e.g. 2.0 on a 2× display).
+        pub scale_factor: f32,
         /// XRGB pixel buffer (softbuffer format: 0x00RRGGBB stored as u32 LE).
         pub pixels: Vec<u32>,
         /// True when `pixels` contains a freshly painted frame not yet presented.
         pub dirty: bool,
+        /// Last known cursor position in physical pixels (used for click events).
+        pub last_cursor: (i32, i32),
     }
 
     impl OsrState {
-        pub fn new(width: i32, height: i32) -> Self {
+        pub fn new(width: i32, height: i32, scale_factor: f64) -> Self {
             let n = (width.max(1) * height.max(1)) as usize;
             Self {
                 size: (width, height),
+                scale_factor: scale_factor as f32,
                 pixels: vec![0u32; n],
                 dirty: false,
+                last_cursor: (0, 0),
             }
         }
 
         /// Resize the pixel buffer to accommodate `(width, height)`.
-        pub fn resize(&mut self, width: i32, height: i32) {
+        pub fn resize(&mut self, width: i32, height: i32, scale_factor: f64) {
             self.size = (width.max(1), height.max(1));
+            self.scale_factor = scale_factor as f32;
             let n = (self.size.0 * self.size.1) as usize;
             self.pixels.resize(n, 0u32);
             self.dirty = false;
@@ -120,6 +127,29 @@ pub mod wayland {
                 }
             }
 
+            fn screen_info(
+                &self,
+                _browser: Option<&mut cef::Browser>,
+                screen_info: Option<&mut ScreenInfo>,
+            ) -> ::std::os::raw::c_int {
+                let Ok(state) = self.state.lock() else { return 0; };
+                if let Some(info) = screen_info {
+                    info.device_scale_factor = state.scale_factor;
+                    info.depth = 32;
+                    info.depth_per_component = 8;
+                    info.is_monochrome = 0;
+                    info.rect = CefRect {
+                        x: 0,
+                        y: 0,
+                        width: state.size.0,
+                        height: state.size.1,
+                    };
+                    info.available_rect = info.rect.clone();
+                    return 1;
+                }
+                0
+            }
+
             fn on_paint(
                 &self,
                 _browser: Option<&mut cef::Browser>,
@@ -146,7 +176,8 @@ pub mod wayland {
                 let Ok(mut state) = self.state.lock() else { return; };
 
                 if state.size != (width, height) {
-                    state.resize(width, height);
+                    let sf = state.scale_factor as f64;
+                    state.resize(width, height, sf);
                 }
 
                 // Convert BGRA (CEF) → XRGB (softbuffer: 0x00RRGGBB).
@@ -173,9 +204,14 @@ pub mod wayland {
         pub fn build(
             initial_width: i32,
             initial_height: i32,
+            scale_factor: f64,
             redraw: Arc<dyn Fn() + Send + Sync>,
         ) -> (RenderHandler, Arc<Mutex<OsrState>>) {
-            let state = Arc::new(Mutex::new(OsrState::new(initial_width, initial_height)));
+            let state = Arc::new(Mutex::new(OsrState::new(
+                initial_width,
+                initial_height,
+                scale_factor,
+            )));
             let handler = Self::new(state.clone(), redraw);
             (handler, state)
         }

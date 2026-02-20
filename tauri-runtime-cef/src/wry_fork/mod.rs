@@ -5000,8 +5000,9 @@ fn handle_event_loop<T: UserEvent>(
                                     let phys = window.inner_size();
                                     let w = phys.width as i32;
                                     let h = phys.height as i32;
+                                    let sf = window.scale_factor();
                                     if let Ok(mut state) = state_arc.lock() {
-                                        state.resize(w, h);
+                                        state.resize(w, h, sf);
                                     }
                                     if let Some(browser) = webview.browser_slot.current() {
                                         if let Some(host) = browser.host() {
@@ -5047,8 +5048,29 @@ fn handle_event_loop<T: UserEvent>(
                                 .filter_map(|wv| wv.browser_slot.current())
                                 .collect();
 
+                            // Update last cursor position before dispatching to browsers.
+                            if let TaoWindowEvent::CursorMoved { position, .. } = ev {
+                                for webview in &window.webviews {
+                                    if let Some(state_arc) = &webview.osr_state {
+                                        if let Ok(mut state) = state_arc.lock() {
+                                            state.last_cursor = (position.x as i32, position.y as i32);
+                                        }
+                                    }
+                                }
+                            }
+
                             for browser in &osr_browsers {
                                 let Some(host) = browser.host() else { continue };
+
+                                // Read last cursor position for events that need it.
+                                let cursor_pos = window
+                                    .webviews
+                                    .iter()
+                                    .find_map(|wv| wv.osr_state.as_ref())
+                                    .and_then(|s| s.lock().ok())
+                                    .map(|s| s.last_cursor)
+                                    .unwrap_or((0, 0));
+
                                 match ev {
                                     TaoWindowEvent::CursorMoved { position, .. } => {
                                         let me = cef::MouseEvent {
@@ -5060,8 +5082,8 @@ fn handle_event_loop<T: UserEvent>(
                                     }
                                     TaoWindowEvent::CursorLeft { .. } => {
                                         let me = cef::MouseEvent {
-                                            x: 0,
-                                            y: 0,
+                                            x: cursor_pos.0,
+                                            y: cursor_pos.1,
                                             modifiers: 0,
                                         };
                                         host.send_mouse_move_event(Some(&me), 1);
@@ -5073,11 +5095,9 @@ fn handle_event_loop<T: UserEvent>(
                                             MouseButton::Middle => cef::MouseButtonType::MIDDLE,
                                             _ => cef::MouseButtonType::LEFT,
                                         };
-                                        // We don't track cursor pos here; send (0,0) — CEF uses
-                                        // the last known position from send_mouse_move_event.
                                         let me = cef::MouseEvent {
-                                            x: 0,
-                                            y: 0,
+                                            x: cursor_pos.0,
+                                            y: cursor_pos.1,
                                             modifiers: 0,
                                         };
                                         // mouse_up=1 means button released, mouse_up=0 means pressed.
@@ -5104,8 +5124,8 @@ fn handle_event_loop<T: UserEvent>(
                                             _ => (0, 0),
                                         };
                                         let me = cef::MouseEvent {
-                                            x: 0,
-                                            y: 0,
+                                            x: cursor_pos.0,
+                                            y: cursor_pos.1,
                                             modifiers: 0,
                                         };
                                         host.send_mouse_wheel_event(Some(&me), dx, dy);
@@ -5956,7 +5976,8 @@ fn create_webview<T: UserEvent>(
                 ));
             });
 
-            let (render_handler, state) = OsrRenderHandler::build(w, h, redraw_fn);
+            let scale_factor = window.scale_factor();
+            let (render_handler, state) = OsrRenderHandler::build(w, h, scale_factor, redraw_fn);
             let client = client_builder
                 .with_osr_render_handler(render_handler)
                 .build();
