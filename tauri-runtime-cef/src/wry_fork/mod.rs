@@ -72,8 +72,8 @@ use tauri_utils::{
 use url::Url;
 
 // CEF imports
-use crate::browser_slot::BrowserSlot;
 use crate::bootstrap::renderer_init_scripts_available;
+use crate::browser_slot::BrowserSlot;
 #[cfg(feature = "new-window-opener-optional")]
 use crate::client::PopupRequestFeatures;
 use crate::client::{BrowserEvent, ResourceRequestPayload, RuntimeClientBuilder};
@@ -146,6 +146,9 @@ mod window;
 
 pub use webview::Webview;
 use window::WindowExt as _;
+
+#[cfg(feature = "wayland-osr")]
+use crate::osr::wayland::{OsrRenderHandler, OsrSurface, OsrState};
 
 /// CEF browser context — replaces WRY's `WebContext`.
 ///
@@ -2414,6 +2417,9 @@ pub struct WebviewWrapper {
     background_color: Arc<Mutex<(u8, u8, u8, u8)>>,
     rect: Arc<Mutex<Rect>>,
     bounds: Arc<Mutex<Option<WebviewBounds>>>,
+    /// OSR pixel-buffer state (Wayland only). The OsrSurface is stored in WindowWrapper.
+    #[cfg(feature = "wayland-osr")]
+    osr_state: Option<Arc<Mutex<OsrState>>>,
 }
 
 fn rgba_to_cef_color((r, g, b, a): (u8, u8, u8, u8)) -> u32 {
@@ -2517,6 +2523,20 @@ fn move_resize_browser_child(
     let size = bounds.size.to_physical::<u32>(window.scale_factor());
     let width = size.width.max(1);
     let height = size.height.max(1);
+
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    if let Ok(handle) = window.window_handle() {
+        if let RawWindowHandle::Wayland(_) = handle.as_raw() {
+            // On Wayland, CEF's Ozone backend manages its own wl_subsurface.
+            // We can't use Xlib calls, but we notify CEF so it updates internally.
+            if let Some(browser) = slot.current() {
+                if let Some(host) = browser.host() {
+                    host.notify_move_or_resize_started();
+                }
+            }
+            return Ok(());
+        }
+    }
 
     let xlib = xlib::Xlib::open().map_err(|_| "failed to open Xlib")?;
     let display = unsafe { (xlib.XOpenDisplay)(std::ptr::null()) };
@@ -3265,6 +3285,9 @@ pub struct WindowWrapper {
     #[cfg(windows)]
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     focused_webview: Arc<Mutex<Option<String>>>,
+    /// OSR softbuffer surface (Wayland only).
+    #[cfg(feature = "wayland-osr")]
+    osr_surface: Option<OsrSurface>,
 }
 
 impl WindowWrapper {
@@ -4726,6 +4749,8 @@ fn handle_user_message<T: UserEvent>(
                         #[cfg(windows)]
                         surface,
                         focused_webview: Default::default(),
+                        #[cfg(feature = "wayland-osr")]
+                        osr_surface: None,
                     },
                 );
                 sender.send(Ok(Arc::downgrade(&window))).unwrap();
@@ -4807,6 +4832,30 @@ fn handle_event_loop<T: UserEvent>(
                         if let Some(surface) = &mut window.surface {
                             if let Some(window) = &window.inner {
                                 window.draw_surface(surface, background_color);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "wayland-osr")]
+        Event::RedrawRequested(id) => {
+            if let Some(window_id) = window_id_map.get(&id) {
+                let mut windows_ref = windows.0.borrow_mut();
+                if let Some(window) = windows_ref.get_mut(&window_id) {
+                    if let Some(osr_surface) = &mut window.osr_surface {
+                        // Find any OSR webview's pixel buffer and blit it.
+                        for webview in &window.webviews {
+                            if let Some(state_arc) = &webview.osr_state {
+                                if let Ok(mut state) = state_arc.lock() {
+                                    if state.dirty {
+                                        let (w, h) = state.size;
+                                        osr_surface.present(&state.pixels, w, h);
+                                        state.dirty = false;
+                                    }
+                                }
+                                break; // one OSR webview per window
                             }
                         }
                     }
@@ -4945,6 +4994,23 @@ fn handle_event_loop<T: UserEvent>(
                         {
                             let size = size.to_logical::<f32>(window.scale_factor());
                             for webview in webviews {
+                                #[cfg(feature = "wayland-osr")]
+                                if let Some(state_arc) = &webview.osr_state {
+                                    // Update the OSR state size and notify CEF.
+                                    let phys = window.inner_size();
+                                    let w = phys.width as i32;
+                                    let h = phys.height as i32;
+                                    if let Ok(mut state) = state_arc.lock() {
+                                        state.resize(w, h);
+                                    }
+                                    if let Some(browser) = webview.browser_slot.current() {
+                                        if let Some(host) = browser.host() {
+                                            host.was_resized();
+                                        }
+                                    }
+                                    continue;
+                                }
+
                                 if let Some(b) = &*webview.bounds.lock().unwrap() {
                                     if let Err(e) = webview.set_bounds(
                                         Rect {
@@ -4967,6 +5033,138 @@ fn handle_event_loop<T: UserEvent>(
                             }
                         }
                     }
+                    #[cfg(feature = "wayland-osr")]
+                    ref ev => {
+                        // Forward input events to the CEF browser host for OSR windows.
+                        use tao::event::{ElementState, MouseButton, MouseScrollDelta};
+                        let windows_ref = windows.0.borrow();
+                        if let Some(window) = windows_ref.get(&window_id) {
+                            // Collect browsers from OSR webviews.
+                            let osr_browsers: Vec<_> = window
+                                .webviews
+                                .iter()
+                                .filter(|wv| wv.osr_state.is_some())
+                                .filter_map(|wv| wv.browser_slot.current())
+                                .collect();
+
+                            for browser in &osr_browsers {
+                                let Some(host) = browser.host() else { continue };
+                                match ev {
+                                    TaoWindowEvent::CursorMoved { position, .. } => {
+                                        let me = cef::MouseEvent {
+                                            x: position.x as i32,
+                                            y: position.y as i32,
+                                            modifiers: 0,
+                                        };
+                                        host.send_mouse_move_event(Some(&me), 0);
+                                    }
+                                    TaoWindowEvent::CursorLeft { .. } => {
+                                        let me = cef::MouseEvent {
+                                            x: 0,
+                                            y: 0,
+                                            modifiers: 0,
+                                        };
+                                        host.send_mouse_move_event(Some(&me), 1);
+                                    }
+                                    TaoWindowEvent::MouseInput { state, button, .. } => {
+                                        let btn = match button {
+                                            MouseButton::Left => cef::MouseButtonType::LEFT,
+                                            MouseButton::Right => cef::MouseButtonType::RIGHT,
+                                            MouseButton::Middle => cef::MouseButtonType::MIDDLE,
+                                            _ => cef::MouseButtonType::LEFT,
+                                        };
+                                        // We don't track cursor pos here; send (0,0) — CEF uses
+                                        // the last known position from send_mouse_move_event.
+                                        let me = cef::MouseEvent {
+                                            x: 0,
+                                            y: 0,
+                                            modifiers: 0,
+                                        };
+                                        // mouse_up=1 means button released, mouse_up=0 means pressed.
+                                        let (mouse_up, click_count) = match state {
+                                            ElementState::Pressed => (0, 1),
+                                            ElementState::Released => (1, 1),
+                                            _ => (0, 1),
+                                        };
+                                        host.send_mouse_click_event(
+                                            Some(&me),
+                                            btn,
+                                            mouse_up,
+                                            click_count,
+                                        );
+                                    }
+                                    TaoWindowEvent::MouseWheel { delta, .. } => {
+                                        let (dx, dy) = match delta {
+                                            MouseScrollDelta::LineDelta(x, y) => {
+                                                (*x as i32 * 120, *y as i32 * 120)
+                                            }
+                                            MouseScrollDelta::PixelDelta(pos) => {
+                                                (pos.x as i32, pos.y as i32)
+                                            }
+                                            _ => (0, 0),
+                                        };
+                                        let me = cef::MouseEvent {
+                                            x: 0,
+                                            y: 0,
+                                            modifiers: 0,
+                                        };
+                                        host.send_mouse_wheel_event(Some(&me), dx, dy);
+                                    }
+                                    TaoWindowEvent::KeyboardInput { event: key_ev, .. } => {
+                                        use tao::event::ElementState;
+                                        use tao::keyboard::Key;
+                                        let is_press =
+                                            key_ev.state == ElementState::Pressed;
+                                        // Map tao logical key to a windows_key_code best-effort.
+                                        let windows_key_code =
+                                            tao_key_to_windows_vk(&key_ev.logical_key);
+                                        let cef_type = if is_press {
+                                            cef::KeyEventType::RAWKEYDOWN
+                                        } else {
+                                            cef::KeyEventType::KEYUP
+                                        };
+                                        let ke = cef::KeyEvent {
+                                            type_: cef_type,
+                                            windows_key_code,
+                                            native_key_code: 0,
+                                            modifiers: 0,
+                                            is_system_key: 0,
+                                            character: 0,
+                                            unmodified_character: 0,
+                                            focus_on_editable_field: 0,
+                                            ..Default::default()
+                                        };
+                                        host.send_key_event(Some(&ke));
+
+                                        // Also send a CHAR event for printable keys on press.
+                                        if is_press {
+                                            if let Key::Character(ch) = &key_ev.logical_key {
+                                                for c in ch.chars() {
+                                                    let char_ke = cef::KeyEvent {
+                                                        type_: cef::KeyEventType::CHAR,
+                                                        windows_key_code: c as i32,
+                                                        character: c as u16,
+                                                        unmodified_character: c as u16,
+                                                        modifiers: 0,
+                                                        native_key_code: 0,
+                                                        is_system_key: 0,
+                                                        focus_on_editable_field: 0,
+                                                        ..Default::default()
+                                                    };
+                                                    host.send_key_event(Some(&char_ke));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    TaoWindowEvent::Focused(focused) => {
+                                        host.set_focus(i32::from(*focused));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "wayland-osr"))]
                     _ => {}
                 }
             }
@@ -5265,6 +5463,17 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
         None
     };
 
+    // If any webview is OSR, create the softbuffer surface now that window is Arc.
+    #[cfg(feature = "wayland-osr")]
+    let osr_surface = {
+        let needs_osr = webviews.iter().any(|w| w.osr_state.is_some());
+        if needs_osr {
+            OsrSurface::new(window.clone())
+        } else {
+            None
+        }
+    };
+
     Ok(WindowWrapper {
         label,
         has_children: AtomicBool::new(false),
@@ -5278,6 +5487,8 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
         #[cfg(windows)]
         surface,
         focused_webview,
+        #[cfg(feature = "wayland-osr")]
+        osr_surface,
     })
 }
 
@@ -5419,7 +5630,7 @@ fn create_webview<T: UserEvent>(
     ));
 
     let browser_slot = BrowserSlot::new();
-    let mut client = RuntimeClientBuilder::new()
+    let client_builder = RuntimeClientBuilder::new()
         .with_browser_slot(browser_slot.clone())
         .with_drag_drop_handler_enabled(drag_drop_handler_enabled)
         .on_before_browse({
@@ -5713,8 +5924,49 @@ fn create_webview<T: UserEvent>(
                 }
                 _ => {}
             }
-        })
-        .build();
+        });
+    // client_builder is now fully configured (except for optional OSR render handler).
+
+    // Detect Wayland before building the browser so we can configure OSR.
+    #[cfg(feature = "wayland-osr")]
+    let is_wayland = {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        window
+            .window_handle()
+            .ok()
+            .map(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_)))
+            .unwrap_or(false)
+    };
+    #[cfg(not(feature = "wayland-osr"))]
+    let is_wayland = false;
+
+    // OSR state created before building the client (Wayland only).
+    #[cfg(feature = "wayland-osr")]
+    let (osr_state, mut client) = {
+        if is_wayland {
+            let size = window.inner_size();
+            let w = size.width as i32;
+            let h = size.height as i32;
+            let proxy_for_redraw = context.proxy.clone();
+            let window_id_for_redraw = window_id.clone();
+            let redraw_fn: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = proxy_for_redraw.send_event(Message::Window(
+                    *window_id_for_redraw.lock().unwrap(),
+                    WindowMessage::RequestRedraw,
+                ));
+            });
+
+            let (render_handler, state) = OsrRenderHandler::build(w, h, redraw_fn);
+            let client = client_builder
+                .with_osr_render_handler(render_handler)
+                .build();
+            (Some(state), client)
+        } else {
+            (None, client_builder.build())
+        }
+    };
+    #[cfg(not(feature = "wayland-osr"))]
+    let (_osr_state, mut client) = (None::<()>, client_builder.build());
 
     #[cfg(feature = "tao-runtime")]
     {
@@ -5745,60 +5997,85 @@ fn create_webview<T: UserEvent>(
 
         let mut browser = None;
         let mut last_handle_error = None;
-        for attempt in 0..=30 {
-            match HostWindowInfo::from_tao_window(window) {
-                Ok(host_window) => {
-                    if host_window.parent_handle == 0 {
-                        last_handle_error = Some("got null parent window handle".to_string());
-                    } else {
-                        let window_info = WindowInfo::default()
-                            .set_as_child(host_window.parent_handle, &cef_bounds);
-                        browser = browser_host_create_browser_sync(
-                            Some(&window_info),
-                            Some(&mut client),
-                            Some(&url),
-                            Some(&settings),
-                            None,
-                            request_context.as_mut(),
-                        );
-                        if browser.is_some() {
-                            if attempt > 0 {
-                                log::warn!(
-                                    "CEF browser creation succeeded after retry {} (parent={:?})",
-                                    attempt,
-                                    host_window.parent_handle
-                                );
+
+        if is_wayland {
+            // OSR path: windowless browser, no X11 parent needed.
+            let window_info = WindowInfo::default().set_as_windowless(0);
+            browser = browser_host_create_browser_sync(
+                Some(&window_info),
+                Some(&mut client),
+                Some(&url),
+                Some(&settings),
+                None,
+                request_context.as_mut(),
+            );
+            if browser.is_none() {
+                let message = format!(
+                    "CEF OSR browser creation failed ({}x{}).",
+                    width, height
+                );
+                log::error!("{message}");
+                return Err(Error::CreateWebview(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    message,
+                ))));
+            }
+        } else {
+            for attempt in 0..=30 {
+                match HostWindowInfo::from_tao_window(window) {
+                    Ok(host_window) => {
+                        if host_window.parent_handle == 0 {
+                            last_handle_error = Some("got null parent window handle".to_string());
+                        } else {
+                            let window_info = WindowInfo::default()
+                                .set_as_child(host_window.parent_handle, &cef_bounds);
+                            browser = browser_host_create_browser_sync(
+                                Some(&window_info),
+                                Some(&mut client),
+                                Some(&url),
+                                Some(&settings),
+                                None,
+                                request_context.as_mut(),
+                            );
+                            if browser.is_some() {
+                                if attempt > 0 {
+                                    log::warn!(
+                                        "CEF browser creation succeeded after retry {} (parent={:?})",
+                                        attempt,
+                                        host_window.parent_handle
+                                    );
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
+                    Err(e) => {
+                        last_handle_error = Some(e.to_string());
+                    }
                 }
-                Err(e) => {
-                    last_handle_error = Some(e.to_string());
-                }
+
+                std::thread::sleep(Duration::from_millis(20));
             }
 
-            std::thread::sleep(Duration::from_millis(20));
-        }
+            if browser.is_none() {
+                let message = if let Some(reason) = last_handle_error {
+                    format!(
+                        "CEF browser creation failed ({reason}; bounds={}x{}+{},{}).",
+                        cef_bounds.width, cef_bounds.height, cef_bounds.x, cef_bounds.y
+                    )
+                } else {
+                    format!(
+                        "CEF browser creation failed (bounds={}x{}+{},{}).",
+                        cef_bounds.width, cef_bounds.height, cef_bounds.x, cef_bounds.y
+                    )
+                };
 
-        if browser.is_none() {
-            let message = if let Some(reason) = last_handle_error {
-                format!(
-                    "CEF browser creation failed ({reason}; bounds={}x{}+{},{}).",
-                    cef_bounds.width, cef_bounds.height, cef_bounds.x, cef_bounds.y
-                )
-            } else {
-                format!(
-                    "CEF browser creation failed (bounds={}x{}+{},{}).",
-                    cef_bounds.width, cef_bounds.height, cef_bounds.x, cef_bounds.y
-                )
-            };
-
-            log::error!("{message}");
-            return Err(Error::CreateWebview(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                message,
-            ))));
+                log::error!("{message}");
+                return Err(Error::CreateWebview(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    message,
+                ))));
+            }
         }
 
         if let Some(browser) = browser.as_ref() {
@@ -5806,7 +6083,11 @@ fn create_webview<T: UserEvent>(
         }
 
         browser_slot.set(browser);
-        let _ = move_resize_browser_child(window, &browser_slot, initial_rect);
+
+        if !is_wayland {
+            let _ = move_resize_browser_child(window, &browser_slot, initial_rect);
+        }
+
         if !focused {
             if let Some(browser) = browser_slot.current() {
                 if let Some(host) = browser.host() {
@@ -5856,6 +6137,8 @@ fn create_webview<T: UserEvent>(
         background_color,
         rect: Arc::new(Mutex::new(initial_rect)),
         bounds: Arc::new(Mutex::new(webview_bounds)),
+        #[cfg(feature = "wayland-osr")]
+        osr_state,
     })
 }
 
@@ -5892,5 +6175,57 @@ fn to_tao_theme(theme: Option<Theme>) -> Option<TaoTheme> {
         Some(Theme::Light) => Some(TaoTheme::Light),
         Some(Theme::Dark) => Some(TaoTheme::Dark),
         _ => None,
+    }
+}
+
+/// Map a tao logical key to a Windows virtual-key code for CEF input events.
+///
+/// This is a best-effort mapping used for OSR on Wayland.
+#[cfg(feature = "wayland-osr")]
+fn tao_key_to_windows_vk(key: &tao::keyboard::Key<'_>) -> i32 {
+    use tao::keyboard::Key;
+    match key {
+        Key::Character(s) => {
+            let c = s.chars().next().unwrap_or('\0');
+            // ASCII printable: VK code = ASCII value.
+            if c.is_ascii() {
+                let upper = c.to_ascii_uppercase();
+                return upper as i32;
+            }
+            0
+        }
+        Key::Enter => 0x0D,        // VK_RETURN
+        Key::Backspace => 0x08,    // VK_BACK
+        Key::Tab => 0x09,          // VK_TAB
+        Key::Escape => 0x1B,       // VK_ESCAPE
+        Key::Space => 0x20,        // VK_SPACE
+        Key::ArrowLeft => 0x25,    // VK_LEFT
+        Key::ArrowUp => 0x26,      // VK_UP
+        Key::ArrowRight => 0x27,   // VK_RIGHT
+        Key::ArrowDown => 0x28,    // VK_DOWN
+        Key::Home => 0x24,         // VK_HOME
+        Key::End => 0x23,          // VK_END
+        Key::PageUp => 0x21,       // VK_PRIOR
+        Key::PageDown => 0x22,     // VK_NEXT
+        Key::Delete => 0x2E,       // VK_DELETE
+        Key::Insert => 0x2D,       // VK_INSERT
+        Key::F1 => 0x70,           // VK_F1
+        Key::F2 => 0x71,
+        Key::F3 => 0x72,
+        Key::F4 => 0x73,
+        Key::F5 => 0x74,
+        Key::F6 => 0x75,
+        Key::F7 => 0x76,
+        Key::F8 => 0x77,
+        Key::F9 => 0x78,
+        Key::F10 => 0x79,
+        Key::F11 => 0x7A,
+        Key::F12 => 0x7B,
+        Key::Control => 0x11,      // VK_CONTROL
+        Key::Alt => 0x12,          // VK_MENU
+        Key::Shift => 0x10,        // VK_SHIFT
+        Key::Super => 0x5B,        // VK_LWIN
+        Key::CapsLock => 0x14,     // VK_CAPITAL
+        _ => 0,
     }
 }

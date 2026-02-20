@@ -48,7 +48,9 @@ pub fn cef_parent_handle_from_raw(
         RawWindowHandle::Win32(handle) => handle.hwnd.get() as cef::sys::cef_window_handle_t,
         RawWindowHandle::Xlib(handle) => handle.window as cef::sys::cef_window_handle_t,
         RawWindowHandle::Xcb(handle) => handle.window.get() as cef::sys::cef_window_handle_t,
-        RawWindowHandle::Wayland(_) => return Err(HostWindowError::WaylandUnsupported),
+        RawWindowHandle::Wayland(handle) => {
+            handle.surface.as_ptr() as usize as cef::sys::cef_window_handle_t
+        }
         RawWindowHandle::AppKit(handle) => {
             handle.ns_view.as_ptr() as usize as cef::sys::cef_window_handle_t
         }
@@ -72,10 +74,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wayland_handle() {
-        let raw =
-            RawWindowHandle::Wayland(WaylandWindowHandle::new(core::ptr::NonNull::dangling()));
-        let err = cef_parent_handle_from_raw(raw).expect_err("wayland should be rejected");
-        assert!(matches!(err, HostWindowError::WaylandUnsupported));
+    fn maps_wayland_handle() {
+        let mut wl_handle = WaylandWindowHandle::new(core::ptr::NonNull::dangling());
+        wl_handle.surface = core::ptr::NonNull::new(42 as *mut _).unwrap();
+        let raw = RawWindowHandle::Wayland(wl_handle);
+        let handle = cef_parent_handle_from_raw(raw).expect("failed to map wayland handle");
+        assert_eq!(handle as usize, 42);
     }
 }

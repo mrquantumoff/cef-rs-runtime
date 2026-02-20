@@ -10,10 +10,18 @@ pub struct CefRuntimeConfig {
     pub cache_path: Option<PathBuf>,
     pub user_agent: Option<String>,
     pub background_color: Option<Color>,
+    /// Enable OSR (off-screen rendering). Required for Wayland.
+    pub windowless_rendering_enabled: bool,
 }
 
 impl Default for CefRuntimeConfig {
     fn default() -> Self {
+        // Auto-detect Wayland and enable OSR when running under it.
+        #[cfg(feature = "wayland-osr")]
+        let windowless_rendering_enabled = is_wayland_session();
+        #[cfg(not(feature = "wayland-osr"))]
+        let windowless_rendering_enabled = false;
+
         Self {
             no_sandbox: true,
             external_message_pump: true,
@@ -22,8 +30,18 @@ impl Default for CefRuntimeConfig {
             cache_path: None,
             user_agent: None,
             background_color: None,
+            windowless_rendering_enabled,
         }
     }
+}
+
+/// Returns true when the current session is a Wayland session.
+#[cfg(feature = "wayland-osr")]
+fn is_wayland_session() -> bool {
+    std::env::var("WAYLAND_DISPLAY").is_ok()
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|v| v.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
 }
 
 impl CefRuntimeConfig {
@@ -32,6 +50,7 @@ impl CefRuntimeConfig {
             no_sandbox: i32::from(self.no_sandbox),
             external_message_pump: i32::from(self.external_message_pump),
             multi_threaded_message_loop: i32::from(self.multi_threaded_message_loop),
+            windowless_rendering_enabled: i32::from(self.windowless_rendering_enabled),
             ..Default::default()
         };
 

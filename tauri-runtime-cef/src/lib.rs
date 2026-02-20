@@ -9,6 +9,9 @@ pub mod dispatch;
 pub mod dispatch_trait;
 pub mod pump;
 
+#[cfg(feature = "wayland-osr")]
+pub mod osr;
+
 #[cfg(feature = "tauri-runtime-adapter")]
 pub mod wry_fork;
 

@@ -12,6 +12,7 @@ repository.workspace = true
 default = ["tao-runtime"]
 tao-runtime = ["dep:tao"]
 tauri-runtime-adapter = ["dep:tauri-runtime", "dep:tauri-utils", "tao-runtime"]
+wayland-osr = ["dep:softbuffer"]
 devtools = ["tauri-runtime/devtools"]
 tracing = []
 unstable = []
@@ -30,6 +31,7 @@ url = "2"
 tao = { version = "0.34.5", default-features = false, features = ["rwh_06"], optional = true }
 tauri-runtime = { version = "2.10", optional = true }
 tauri-utils = { version = "2.8", optional = true }
+softbuffer = { version = "0.4", optional = true, default-features = false, features = ["wayland"] }
 
 [target."cfg(any(target_os = \"linux\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\"))".dependencies]
 gtk = { version = "0.18", features = ["v3_24"] }

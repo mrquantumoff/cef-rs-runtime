@@ -38,42 +38,6 @@ fn load_cef() -> LoadedLibrary {
     ()
 }
 
-#[cfg(target_os = "linux")]
-fn ensure_x11_embedding_backend() -> Result<(), Box<dyn std::error::Error>> {
-    let is_subprocess = std::env::args_os()
-        .any(|arg| arg == OsStr::new("--type") || arg.to_string_lossy().starts_with("--type="));
-
-    if is_subprocess {
-        return Ok(());
-    }
-
-    if std::env::var_os("TAURI_RUNTIME_CEF_X11_REEXEC").is_none() {
-        let is_wayland_session = std::env::var("XDG_SESSION_TYPE")
-            .map(|value| value.eq_ignore_ascii_case("wayland"))
-            .unwrap_or(false);
-
-        if is_wayland_session {
-            let status = Command::new(std::env::current_exe()?)
-                .args(std::env::args_os().skip(1))
-                .env("TAURI_RUNTIME_CEF_X11_REEXEC", "1")
-                .env("GDK_BACKEND", "x11")
-                .env("WINIT_UNIX_BACKEND", "x11")
-                .status()?;
-
-            std::process::exit(status.code().unwrap_or(1));
-        }
-    }
-
-    if std::env::var_os("GDK_BACKEND").is_none() {
-        std::env::set_var("GDK_BACKEND", "x11");
-    }
-    if std::env::var_os("WINIT_UNIX_BACKEND").is_none() {
-        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
-    }
-
-    Ok(())
-}
-
 wrap_app! {
     struct RuntimeApp {
         handle: Arc<Mutex<TaoExternalPumpHandle>>,
@@ -99,20 +63,33 @@ wrap_app! {
             if process_type.is_empty() {
                 #[cfg(target_os = "linux")]
                 {
-                    command_line.append_switch(Some(&CefString::from("disable-gpu")));
-                    command_line
-                        .append_switch(Some(&CefString::from("disable-gpu-compositing")));
-                    command_line
-                        .append_switch(Some(&CefString::from("disable-gpu-process-crash-limit")));
+                    let is_wayland_session = std::env::var("XDG_SESSION_TYPE")
+                        .map(|value| value.eq_ignore_ascii_case("wayland"))
+                        .unwrap_or(false);
+
+                    if is_wayland_session {
+                        command_line.append_switch_with_value(
+                            Some(&CefString::from("ozone-platform-hint")),
+                            Some(&CefString::from("wayland")),
+                        );
+                    }
+
+                    command_line.append_switch(Some(&CefString::from("disable-gpu-process-crash-limit")));
                     command_line.append_switch(Some(&CefString::from("in-process-gpu")));
-                    command_line.append_switch_with_value(
-                        Some(&CefString::from("use-gl")),
-                        Some(&CefString::from("swiftshader")),
-                    );
-                    command_line.append_switch_with_value(
-                        Some(&CefString::from("use-angle")),
-                        Some(&CefString::from("swiftshader")),
-                    );
+
+                    if !is_wayland_session {
+                        command_line.append_switch(Some(&CefString::from("disable-gpu")));
+                        command_line
+                            .append_switch(Some(&CefString::from("disable-gpu-compositing")));
+                        command_line.append_switch_with_value(
+                            Some(&CefString::from("use-gl")),
+                            Some(&CefString::from("swiftshader")),
+                        );
+                        command_line.append_switch_with_value(
+                            Some(&CefString::from("use-angle")),
+                            Some(&CefString::from("swiftshader")),
+                        );
+                    }
                 }
             }
         }
@@ -174,8 +151,7 @@ wrap_browser_process_handler! {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(target_os = "linux")]
-    ensure_x11_embedding_backend()?;
+    // Removed X11 backend enforcement
 
     let _library = load_cef();
 

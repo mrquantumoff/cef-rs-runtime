@@ -122,6 +122,9 @@ struct RuntimeClientState {
     browser_slot: BrowserSlot,
     callbacks: RuntimeClientCallbacks,
     ipc_router: Arc<BrowserSideRouter>,
+    /// OSR render handler (only set on Wayland).
+    #[cfg(feature = "wayland-osr")]
+    osr_render_handler: Option<cef::RenderHandler>,
 }
 
 impl RuntimeClientState {
@@ -135,6 +138,9 @@ impl RuntimeClientState {
 pub struct RuntimeClientBuilder {
     browser_slot: BrowserSlot,
     callbacks: RuntimeClientCallbacks,
+    /// OSR render handler (only used on Wayland).
+    #[cfg(feature = "wayland-osr")]
+    osr_render_handler: Option<cef::RenderHandler>,
 }
 
 impl Default for RuntimeClientBuilder {
@@ -142,6 +148,8 @@ impl Default for RuntimeClientBuilder {
         Self {
             browser_slot: BrowserSlot::new(),
             callbacks: RuntimeClientCallbacks::default(),
+            #[cfg(feature = "wayland-osr")]
+            osr_render_handler: None,
         }
     }
 }
@@ -220,12 +228,21 @@ impl RuntimeClientBuilder {
         self
     }
 
+    /// Attach an OSR `RenderHandler` (Wayland only).
+    #[cfg(feature = "wayland-osr")]
+    pub fn with_osr_render_handler(mut self, handler: cef::RenderHandler) -> Self {
+        self.osr_render_handler = Some(handler);
+        self
+    }
+
     pub fn build(self) -> Client {
         let ipc_router = BrowserSideRouter::new(MessageRouterConfig::default());
         let state = Arc::new(RuntimeClientState {
             browser_slot: self.browser_slot,
             callbacks: self.callbacks,
             ipc_router: ipc_router.clone(),
+            #[cfg(feature = "wayland-osr")]
+            osr_render_handler: self.osr_render_handler,
         });
 
         let _ = ipc_router.add_handler(
@@ -581,6 +598,11 @@ wrap_client! {
 
         fn keyboard_handler(&self) -> Option<KeyboardHandler> {
             Some(RuntimeKeyboardHandler::new(self.state.clone()))
+        }
+
+        #[cfg(feature = "wayland-osr")]
+        fn render_handler(&self) -> Option<RenderHandler> {
+            self.state.osr_render_handler.clone()
         }
 
         fn on_process_message_received(
