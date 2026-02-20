@@ -17,7 +17,9 @@ use tauri_runtime::webview::{NewWindowFeatures, NewWindowResponse};
 use tauri_runtime::{
     dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size},
     monitor::Monitor,
-    webview::{DetachedWebview, DownloadEvent, PageLoadEvent, PendingWebview},
+    webview::{
+        DetachedWebview, DownloadEvent, InitializationScript, PageLoadEvent, PendingWebview,
+    },
     window::{
         CursorIcon, DetachedWindow, DetachedWindowWebview, DragDropEvent, PendingWindow, RawWindow,
         WebviewEvent, WindowBuilder, WindowBuilderBase, WindowEvent, WindowId,
@@ -71,6 +73,7 @@ use url::Url;
 
 // CEF imports
 use crate::browser_slot::BrowserSlot;
+use crate::bootstrap::renderer_init_scripts_available;
 #[cfg(feature = "new-window-opener-optional")]
 use crate::client::PopupRequestFeatures;
 use crate::client::{BrowserEvent, ResourceRequestPayload, RuntimeClientBuilder};
@@ -78,10 +81,25 @@ use crate::client::{BrowserEvent, ResourceRequestPayload, RuntimeClientBuilder};
 use crate::tao_window::HostWindowInfo;
 use cef::rc::Rc;
 use cef::{
-    browser_host_create_browser_sync, cookie_manager_get_global_manager, BrowserSettings,
+    browser_host_create_browser_sync, cookie_manager_get_global_manager, dictionary_value_create,
+    process_message_create, request_context_create_context, value_create, BrowserSettings,
     CefString, CookieVisitor, ImplBrowser, ImplBrowserHost, ImplCookieManager, ImplCookieVisitor,
-    ImplFrame, ImplRequestContext, Rect as CefRect, WindowInfo, WrapCookieVisitor,
+    ImplDictionaryValue, ImplFrame, ImplListValue, ImplPreferenceManager, ImplProcessMessage,
+    ImplRequestContext, ImplValue, ProcessId, Rect as CefRect, RequestContext,
+    RequestContextSettings, WindowInfo, WrapCookieVisitor,
 };
+
+#[cfg(all(
+    feature = "tao-runtime",
+    any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )
+))]
+use x11_dl::xlib;
 
 pub use tao;
 pub use tao::window::{Window, WindowBuilder as TaoWindowBuilder, WindowId as TaoWindowId};
@@ -2390,6 +2408,7 @@ impl<T: UserEvent> WindowDispatch<T> for WryWindowDispatcher<T> {
 pub struct WebviewWrapper {
     label: String,
     id: WebviewId,
+    _client: cef::Client,
     browser_slot: BrowserSlot,
     webview_event_listeners: WebviewEventListeners,
     background_color: Arc<Mutex<(u8, u8, u8, u8)>>,
@@ -2399,6 +2418,14 @@ pub struct WebviewWrapper {
 
 fn rgba_to_cef_color((r, g, b, a): (u8, u8, u8, u8)) -> u32 {
     ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+fn zoom_factor_to_cef_level(zoom_factor: f64) -> f64 {
+    if !zoom_factor.is_finite() || zoom_factor <= 0.0 {
+        return 0.0;
+    }
+
+    (zoom_factor.ln() / 1.2_f64.ln()).clamp(-10.0, 10.0)
 }
 
 fn apply_background_color(
@@ -2415,6 +2442,121 @@ fn apply_background_color(
     } else {
         Err("browser is not available")
     }
+}
+
+fn sanitize_bounds_for_window(bounds: Rect, window: &Window) -> Rect {
+    let scale_factor = window.scale_factor();
+    let window_size = window.inner_size();
+
+    let mut position = bounds.position.to_physical::<i32>(scale_factor);
+    let mut size = bounds.size.to_physical::<u32>(scale_factor);
+
+    if size.width <= 1 || size.height <= 1 {
+        position = PhysicalPosition::new(0, 0);
+        size = PhysicalSize::new(window_size.width.max(1), window_size.height.max(1));
+    }
+
+    if position.x < 0 {
+        position.x = 0;
+    }
+    if position.y < 0 {
+        position.y = 0;
+    }
+
+    if window_size.width > 0 && (position.x as u32) >= window_size.width {
+        position.x = 0;
+    }
+    if window_size.height > 0 && (position.y as u32) >= window_size.height {
+        position.y = 0;
+    }
+
+    if window_size.width > 0 {
+        let max_width = window_size.width.saturating_sub(position.x as u32).max(1);
+        size.width = size.width.min(max_width);
+    }
+    if window_size.height > 0 {
+        let max_height = window_size.height.saturating_sub(position.y as u32).max(1);
+        size.height = size.height.min(max_height);
+    }
+
+    Rect {
+        position: Position::Physical(position),
+        size: Size::Physical(size),
+    }
+}
+
+#[cfg(all(
+    feature = "tao-runtime",
+    any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )
+))]
+fn move_resize_browser_child(
+    window: &Window,
+    slot: &BrowserSlot,
+    bounds: Rect,
+) -> std::result::Result<(), &'static str> {
+    let Some(browser) = slot.current() else {
+        return Err("browser is not available");
+    };
+    let Some(host) = browser.host() else {
+        return Err("browser host is not available");
+    };
+
+    let child_handle = host.window_handle();
+    if child_handle == 0 {
+        return Err("browser child window handle is not available");
+    }
+
+    let bounds = sanitize_bounds_for_window(bounds, window);
+    let position = bounds.position.to_physical::<i32>(window.scale_factor());
+    let size = bounds.size.to_physical::<u32>(window.scale_factor());
+    let width = size.width.max(1);
+    let height = size.height.max(1);
+
+    let xlib = xlib::Xlib::open().map_err(|_| "failed to open Xlib")?;
+    let display = unsafe { (xlib.XOpenDisplay)(std::ptr::null()) };
+    if display.is_null() {
+        return Err("failed to open X11 display");
+    }
+
+    unsafe {
+        (xlib.XMoveResizeWindow)(
+            display,
+            child_handle as xlib::Window,
+            position.x,
+            position.y,
+            width,
+            height,
+        );
+        (xlib.XMapRaised)(display, child_handle as xlib::Window);
+        (xlib.XFlush)(display);
+        (xlib.XCloseDisplay)(display);
+    }
+
+    Ok(())
+}
+
+#[cfg(not(all(
+    feature = "tao-runtime",
+    any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )
+)))]
+fn move_resize_browser_child(
+    _window: &Window,
+    _slot: &BrowserSlot,
+    _bounds: Rect,
+) -> std::result::Result<(), &'static str> {
+    Ok(())
 }
 
 fn get_cookie_manager(slot: &BrowserSlot) -> Option<cef::CookieManager> {
@@ -2549,16 +2691,286 @@ fn collect_cookies(
         .map_err(|_| "failed to collect cookies")
 }
 
-fn resource_request_to_http_request(request: &ResourceRequestPayload) -> Option<Request<Vec<u8>>> {
-    let mut builder = Request::builder()
-        .method(request.method.as_str())
-        .uri(request.url.as_str());
+fn resource_request_to_http_request(payload: &ResourceRequestPayload) -> Option<Request<Vec<u8>>> {
+    let uri = http::Uri::try_from(payload.url.as_str()).ok().or_else(|| {
+        Url::parse(&payload.url).ok().and_then(|url| {
+            let mut fallback = format!("http://localhost{}", url.path());
+            if let Some(query) = url.query() {
+                fallback.push('?');
+                fallback.push_str(query);
+            }
+            http::Uri::try_from(fallback).ok()
+        })
+    })?;
 
-    for (name, value) in &request.headers {
-        builder = builder.header(name.as_str(), value.as_str());
+    let mut request = Request::builder()
+        .method(payload.method.as_str())
+        .uri(uri)
+        .body(payload.body.clone())
+        .ok()?;
+
+    for (name, value) in &payload.headers {
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(value),
+        ) {
+            request.headers_mut().insert(name, value);
+        }
     }
 
-    builder.body(request.body.clone()).ok()
+    Some(request)
+}
+
+fn apply_cors_headers_for_custom_protocol(
+    request: &ResourceRequestPayload,
+    protocol_name: &str,
+    response: &mut http::Response<Cow<'static, [u8]>>,
+) {
+    let headers = response.headers_mut();
+    if !headers.contains_key(http::header::ACCESS_CONTROL_ALLOW_ORIGIN) {
+        let origin = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("origin"))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("*");
+
+        let allow_origin = http::HeaderValue::from_str(origin)
+            .unwrap_or_else(|_| http::HeaderValue::from_static("*"));
+        headers.insert(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin);
+    }
+
+    if request.method.eq_ignore_ascii_case("OPTIONS")
+        && !headers.contains_key(http::header::ACCESS_CONTROL_ALLOW_HEADERS)
+    {
+        headers.insert(
+            http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+            http::HeaderValue::from_static("*"),
+        );
+    }
+
+    if protocol_name == "ipc" && !headers.contains_key(http::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+    {
+        headers.insert(
+            http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            http::HeaderValue::from_static("Tauri-Response"),
+        );
+    }
+}
+
+fn protocol_name_from_url(url: &Url) -> Option<String> {
+    let scheme = url.scheme();
+    if !matches!(scheme, "http" | "https") {
+        return Some(scheme.to_string());
+    }
+
+    let host = url.host_str()?;
+    let protocol = host.strip_suffix(".localhost")?;
+    if protocol.is_empty() {
+        return None;
+    }
+
+    Some(protocol.to_string())
+}
+
+fn normalize_cef_initial_url(url: &str, use_https_scheme: bool) -> String {
+    let Ok(parsed_url) = Url::parse(url) else {
+        return url.to_string();
+    };
+
+    if parsed_url.scheme() != "tauri" || parsed_url.host_str() != Some("localhost") {
+        return url.to_string();
+    }
+
+    let scheme = if use_https_scheme { "https" } else { "http" };
+    let mut normalized = format!("{scheme}://tauri.localhost{}", parsed_url.path());
+    if let Some(query) = parsed_url.query() {
+        normalized.push('?');
+        normalized.push_str(query);
+    }
+    if let Some(fragment) = parsed_url.fragment() {
+        normalized.push('#');
+        normalized.push_str(fragment);
+    }
+
+    normalized
+}
+
+fn set_string_preference(context: &RequestContext, name: &str, value: &str) -> bool {
+    let name_string = name.to_string();
+    let name = CefString::from(name);
+    if context.can_set_preference(Some(&name)) == 0 {
+        log::warn!("CEF cannot set preference '{}'", name_string);
+        return false;
+    }
+
+    let mut pref_value = match value_create() {
+        Some(value) => value,
+        None => {
+            log::warn!(
+                "CEF failed to allocate preference value for '{}'",
+                name_string
+            );
+            return false;
+        }
+    };
+
+    if pref_value.set_string(Some(&CefString::from(value))) == 0 {
+        log::warn!(
+            "CEF failed to assign preference value for '{}'",
+            name_string
+        );
+        return false;
+    }
+
+    let mut error = CefString::default();
+    if context.set_preference(Some(&name), Some(&mut pref_value), Some(&mut error)) == 0 {
+        let error = error.to_string();
+        if error.is_empty() {
+            log::warn!("CEF rejected preference '{}'", name_string);
+        } else {
+            log::warn!("CEF rejected preference '{}': {error}", name_string);
+        }
+        return false;
+    }
+
+    true
+}
+
+fn apply_proxy_preference(context: &RequestContext, proxy_url: &Url) {
+    let Some(host) = proxy_url.host_str() else {
+        log::warn!("ignoring proxy_url without host: {proxy_url}");
+        return;
+    };
+
+    let proxy_server = proxy_url
+        .port_or_known_default()
+        .map(|port| format!("{}://{host}:{port}", proxy_url.scheme()))
+        .unwrap_or_else(|| format!("{}://{host}", proxy_url.scheme()));
+
+    let mut proxy_dict = match dictionary_value_create() {
+        Some(dict) => dict,
+        None => {
+            log::warn!("CEF failed to allocate proxy preference dictionary");
+            return;
+        }
+    };
+
+    let mode_key = CefString::from("mode");
+    let mode_value = CefString::from("fixed_servers");
+    let _ = proxy_dict.set_string(Some(&mode_key), Some(&mode_value));
+
+    let server_key = CefString::from("server");
+    let server_value = CefString::from(proxy_server.as_str());
+    let _ = proxy_dict.set_string(Some(&server_key), Some(&server_value));
+
+    let bypass_key = CefString::from("bypass_list");
+    let bypass_value = CefString::from("<-loopback>");
+    let _ = proxy_dict.set_string(Some(&bypass_key), Some(&bypass_value));
+
+    let mut proxy_value = match value_create() {
+        Some(value) => value,
+        None => {
+            log::warn!("CEF failed to allocate proxy preference value");
+            return;
+        }
+    };
+
+    if proxy_value.set_dictionary(Some(&mut proxy_dict)) == 0 {
+        log::warn!("CEF failed to encode proxy preference value");
+        return;
+    }
+
+    let pref_name = CefString::from("proxy");
+    if context.can_set_preference(Some(&pref_name)) == 0 {
+        log::warn!("CEF cannot set preference 'proxy'");
+        return;
+    }
+
+    let mut error = CefString::default();
+    if context.set_preference(Some(&pref_name), Some(&mut proxy_value), Some(&mut error)) == 0 {
+        let error = error.to_string();
+        if error.is_empty() {
+            log::warn!("CEF rejected proxy preference");
+        } else {
+            log::warn!("CEF rejected proxy preference: {error}");
+        }
+    }
+}
+
+fn create_request_context_for_webview(
+    attributes: &tauri_runtime::webview::WebviewAttributes,
+) -> Option<RequestContext> {
+    let mut should_create_context =
+        attributes.incognito || attributes.user_agent.is_some() || attributes.proxy_url.is_some();
+    let mut settings = RequestContextSettings::default();
+
+    if !attributes.incognito {
+        if let Some(data_directory) = attributes.data_directory.as_ref() {
+            should_create_context = true;
+            if let Err(error) = std::fs::create_dir_all(data_directory) {
+                log::warn!(
+                    "failed to create CEF data directory '{}': {error}",
+                    data_directory.display()
+                );
+            } else {
+                settings.cache_path = CefString::from(data_directory.to_string_lossy().as_ref());
+                settings.persist_session_cookies = 1;
+            }
+        }
+    }
+
+    if !should_create_context {
+        return None;
+    }
+
+    let context = request_context_create_context(Some(&settings), None);
+    let Some(context) = context else {
+        log::warn!("failed to create custom CEF request context");
+        return None;
+    };
+
+    if let Some(user_agent) = attributes.user_agent.as_deref() {
+        let _ = set_string_preference(&context, "general.useragent.override", user_agent);
+    }
+
+    if let Some(proxy_url) = attributes.proxy_url.as_ref() {
+        apply_proxy_preference(&context, proxy_url);
+    }
+
+    Some(context)
+}
+
+fn send_init_scripts_to_renderer(browser: &cef::Browser, scripts: &[InitializationScript]) {
+    let Some(main_frame) = browser.main_frame() else {
+        return;
+    };
+
+    let clear_name = CefString::from(INIT_SCRIPT_CLEAR_MESSAGE);
+    if let Some(mut message) = process_message_create(Some(&clear_name)) {
+        main_frame.send_process_message(ProcessId::RENDERER, Some(&mut message));
+    }
+
+    for script in scripts {
+        let message_name = CefString::from(INIT_SCRIPT_ADD_MESSAGE);
+        let Some(mut message) = process_message_create(Some(&message_name)) else {
+            continue;
+        };
+        let Some(arguments) = message.argument_list() else {
+            continue;
+        };
+        if arguments.set_size(2) == 0 {
+            continue;
+        }
+
+        let script_code = CefString::from(script.script.as_str());
+        if arguments.set_string(0, Some(&script_code)) == 0 {
+            continue;
+        }
+        let _ = arguments.set_bool(1, i32::from(script.for_main_frame_only));
+
+        main_frame.send_process_message(ProcessId::RENDERER, Some(&mut message));
+    }
 }
 
 #[cfg(feature = "new-window-opener-optional")]
@@ -2664,9 +3076,15 @@ impl WebviewWrapper {
         Err("browser is not available")
     }
 
-    fn set_bounds(&self, bounds: Rect) -> std::result::Result<(), &'static str> {
+    fn set_bounds(&self, bounds: Rect, window: &Window) -> std::result::Result<(), &'static str> {
+        let bounds = sanitize_bounds_for_window(bounds, window);
+
         if let Ok(mut rect) = self.rect.lock() {
             *rect = bounds;
+        }
+
+        if let Err(error) = move_resize_browser_child(window, &self.browser_slot, bounds) {
+            log::debug!("failed to move/resize native browser child: {error}");
         }
         self.browser_slot.notify_resized();
         Ok(())
@@ -2683,7 +3101,7 @@ impl WebviewWrapper {
     fn zoom(&self, scale_factor: f64) -> std::result::Result<(), &'static str> {
         if let Some(browser) = self.browser_slot.current() {
             if let Some(host) = browser.host() {
-                host.set_zoom_level(scale_factor);
+                host.set_zoom_level(zoom_factor_to_cef_level(scale_factor));
                 return Ok(());
             }
         }
@@ -4063,7 +4481,7 @@ fn handle_user_message<T: UserEvent>(
                             b.y_rate = position.y / window_size.height;
                         }
 
-                        if let Err(e) = webview.set_bounds(bounds) {
+                        if let Err(e) = webview.set_bounds(bounds, window.as_ref()) {
                             log::error!("failed to set webview size: {e}");
                         }
                     }
@@ -4081,7 +4499,7 @@ fn handle_user_message<T: UserEvent>(
                                 b.height_rate = size.height / window_size.height;
                             }
 
-                            if let Err(e) = webview.set_bounds(bounds) {
+                            if let Err(e) = webview.set_bounds(bounds, window.as_ref()) {
                                 log::error!("failed to set webview size: {e}");
                             }
                         }
@@ -4103,7 +4521,7 @@ fn handle_user_message<T: UserEvent>(
                                 b.y_rate = position.y / window_size.height;
                             }
 
-                            if let Err(e) = webview.set_bounds(bounds) {
+                            if let Err(e) = webview.set_bounds(bounds, window.as_ref()) {
                                 log::error!("failed to set webview position: {e}");
                             }
                         }
@@ -4536,18 +4954,21 @@ fn handle_event_loop<T: UserEvent>(
                             let size = size.to_logical::<f32>(window.scale_factor());
                             for webview in webviews {
                                 if let Some(b) = &*webview.bounds.lock().unwrap() {
-                                    if let Err(e) = webview.set_bounds(Rect {
-                                        position: LogicalPosition::new(
-                                            size.width * b.x_rate,
-                                            size.height * b.y_rate,
-                                        )
-                                        .into(),
-                                        size: LogicalSize::new(
-                                            size.width * b.width_rate,
-                                            size.height * b.height_rate,
-                                        )
-                                        .into(),
-                                    }) {
+                                    if let Err(e) = webview.set_bounds(
+                                        Rect {
+                                            position: LogicalPosition::new(
+                                                size.width * b.x_rate,
+                                                size.height * b.y_rate,
+                                            )
+                                            .into(),
+                                            size: LogicalSize::new(
+                                                size.width * b.width_rate,
+                                                size.height * b.height_rate,
+                                            )
+                                            .into(),
+                                        },
+                                        window.as_ref(),
+                                    ) {
                                         log::error!("failed to autoresize webview: {e}");
                                     }
                                 }
@@ -4877,6 +5298,49 @@ enum WebviewKind {
     WindowChild,
 }
 
+const INIT_SCRIPT_ADD_MESSAGE: &str = "__TAURI_ADD_INIT_SCRIPT__";
+const INIT_SCRIPT_CLEAR_MESSAGE: &str = "__TAURI_CLEAR_INIT_SCRIPTS__";
+
+const CEF_IPC_FALLBACK_SHIM: &str = r#"
+(() => {
+  if (window.ipc && typeof window.ipc.postMessage === "function") {
+    return;
+  }
+
+  const postMessage = (message) => {
+    if (typeof window.cefQuery !== "function") {
+      console.error("tauri-runtime-cef: window.cefQuery is not available for IPC fallback");
+      return;
+    }
+
+    let request = "";
+    if (typeof message === "string") {
+      request = message;
+    } else {
+      try {
+        request = JSON.stringify(message);
+      } catch (_error) {
+        request = String(message);
+      }
+    }
+
+    window.cefQuery({
+      request,
+      onFailure: (_code, error) => {
+        if (error) {
+          console.error("tauri-runtime-cef: IPC query failed:", error);
+        }
+      },
+    });
+  };
+
+  Object.defineProperty(window, "ipc", {
+    configurable: true,
+    value: Object.freeze({ postMessage }),
+  });
+})();
+"#;
+
 #[derive(Debug, Clone)]
 struct WebviewBounds {
     x_rate: f32,
@@ -4915,13 +5379,14 @@ fn create_webview<T: UserEvent>(
 
     let scale_factor = window.scale_factor();
     let default_size = window.inner_size();
-    let initialization_scripts = Arc::new(
-        webview_attributes
-            .initialization_scripts
-            .iter()
-            .map(|script| script.script.clone())
-            .collect::<Vec<_>>(),
-    );
+    let initial_url = normalize_cef_initial_url(url.as_str(), webview_attributes.use_https_scheme);
+    let mut initialization_scripts = vec![InitializationScript {
+        script: CEF_IPC_FALLBACK_SHIM.to_string(),
+        for_main_frame_only: true,
+    }];
+    initialization_scripts.extend(webview_attributes.initialization_scripts.iter().cloned());
+    let initialization_scripts = Arc::new(initialization_scripts);
+    let use_load_started_init_script_fallback = !renderer_init_scripts_available();
     let javascript_disabled = webview_attributes.javascript_disabled;
     let focused = webview_attributes.focus;
     let drag_drop_handler_enabled = webview_attributes.drag_drop_handler_enabled;
@@ -4949,11 +5414,16 @@ fn create_webview<T: UserEvent>(
     > = new_window_handler.map(Arc::from);
     #[cfg(not(feature = "new-window-opener-optional"))]
     let has_new_window_handler = new_window_handler.is_some();
+    let default_background = if webview_attributes.transparent {
+        (0, 0, 0, 0)
+    } else {
+        (255, 255, 255, 255)
+    };
     let background_color = Arc::new(Mutex::new(
         webview_attributes
             .background_color
             .map(Into::into)
-            .unwrap_or((255, 255, 255, 255)),
+            .unwrap_or(default_background),
     ));
 
     let browser_slot = BrowserSlot::new();
@@ -4979,54 +5449,71 @@ fn create_webview<T: UserEvent>(
         .on_resource_request({
             let web_resource_request_handler = web_resource_request_handler.clone();
             let uri_scheme_protocols = uri_scheme_protocols.clone();
-            move |request| {
-                if let Ok(parsed_url) = Url::parse(&request.url) {
+            let protocol_webview_id = label.clone();
+            move |request_payload| {
+                if let Ok(parsed_url) = Url::parse(&request_payload.url) {
                     if let Ok(protocols) = uri_scheme_protocols.lock() {
-                        if let Some(protocol_handler) = protocols.get(parsed_url.scheme()) {
-                            if let Some(request) = resource_request_to_http_request(&request) {
-                                let (tx, rx) = channel();
-                                protocol_handler(
-                                    parsed_url.scheme(),
-                                    request,
-                                    Box::new(move |response| {
-                                        let _ = tx.send(response);
-                                    }),
-                                );
+                        let protocol_name = protocol_name_from_url(&parsed_url);
+                        if let Some(protocol_name) = protocol_name.as_deref() {
+                            if protocol_name == "ipc" {
+                                log::debug!("handling ipc custom protocol request: {}", request_payload.url);
+                            }
+                            if let Some(protocol_handler) = protocols.get(protocol_name) {
+                                if let Some(request) = resource_request_to_http_request(&request_payload) {
+                                    let request_for_handler = request.clone();
+                                    let (tx, rx) = channel();
+                                    protocol_handler(
+                                        protocol_webview_id.as_str(),
+                                        request,
+                                        Box::new(move |response| {
+                                            let _ = tx.send(response);
+                                        }),
+                                    );
 
-                                match rx.recv_timeout(Duration::from_secs(10)) {
-                                    Ok(response) => return Some(response),
-                                    Err(_) => {
-                                        log::warn!(
-                                            "timed out waiting for custom protocol response: {}",
-                                            parsed_url
-                                        );
-                                        return Some(
-                                            http::Response::builder()
-                                                .status(504)
-                                                .body(Cow::Owned(Vec::new()))
-                                                .expect("valid timeout response"),
-                                        );
+                                    match rx.recv_timeout(Duration::from_secs(10)) {
+                                        Ok(mut response) => {
+                                            if let Ok(handler) = web_resource_request_handler.lock()
+                                            {
+                                                if let Some(handler) = handler.as_ref() {
+                                                    handler(request_for_handler, &mut response);
+                                                }
+                                            }
+
+                                            apply_cors_headers_for_custom_protocol(
+                                                &request_payload,
+                                                protocol_name,
+                                                &mut response,
+                                            );
+
+                                            if protocol_name == "ipc" {
+                                                let has_acao = response
+                                                    .headers()
+                                                    .contains_key(http::header::ACCESS_CONTROL_ALLOW_ORIGIN);
+                                                log::debug!(
+                                                    "ipc protocol response status={} acao={}",
+                                                    response.status(),
+                                                    has_acao
+                                                );
+                                            }
+
+                                            return Some(response);
+                                        }
+                                        Err(_) => {
+                                            log::warn!(
+                                                "timed out waiting for custom protocol response: {}",
+                                                parsed_url
+                                            );
+                                            return Some(
+                                                http::Response::builder()
+                                                    .status(504)
+                                                    .body(Cow::Owned(Vec::new()))
+                                                    .expect("valid timeout response"),
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                        }
-                    }
-                }
-
-                if let Ok(handler) = web_resource_request_handler.lock() {
-                    if let Some(handler) = handler.as_ref() {
-                        if let Some(request) = resource_request_to_http_request(&request) {
-                            let mut response = http::Response::builder()
-                                .status(204)
-                                .body(Cow::Owned(Vec::<u8>::new()))
-                                .expect("valid empty response");
-                            handler(request, &mut response);
-
-                            if response.status().as_u16() != 204
-                                || !response.headers().is_empty()
-                                || !response.body().is_empty()
-                            {
-                                return Some(response);
+                            } else if protocol_name == "ipc" {
+                                log::warn!("ipc protocol handler is not registered in this webview");
                             }
                         }
                     }
@@ -5153,8 +5640,10 @@ fn create_webview<T: UserEvent>(
                         let _ = apply_background_color(&browser_slot, *color);
                     }
 
-                    for script in initialization_scripts.iter() {
-                        let _ = browser_slot.eval(script);
+                    if use_load_started_init_script_fallback {
+                        for script in initialization_scripts.iter() {
+                            let _ = browser_slot.eval(script.script.as_str());
+                        }
                     }
                 }
                 BrowserEvent::LoadFinished { url, .. } => {
@@ -5183,7 +5672,16 @@ fn create_webview<T: UserEvent>(
                     }
 
                     let payload = arguments.last().cloned().unwrap_or_default();
-                    let request = Request::builder().uri("tauri://ipc").body(payload);
+                    let request_uri = arguments
+                        .first()
+                        .filter(|candidate| Url::parse(candidate).is_ok())
+                        .cloned()
+                        .unwrap_or_else(|| "tauri://localhost".to_string());
+                    let request = Request::builder()
+                        .method("POST")
+                        .uri(request_uri)
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(payload);
 
                     if let Ok(request) = request {
                         if let Ok(handler) = ipc_handler.lock() {
@@ -5248,13 +5746,18 @@ fn create_webview<T: UserEvent>(
             width,
             height,
         };
-        let url = CefString::from(url.as_str());
+        let url = CefString::from(initial_url.as_str());
+        let mut request_context = create_request_context_for_webview(&webview_attributes);
         let mut settings = BrowserSettings::default();
         if let Ok(color) = background_color.lock() {
             settings.background_color = rgba_to_cef_color(*color);
         }
         if javascript_disabled {
             settings.javascript = cef::State::DISABLED;
+        }
+        if !webview_attributes.clipboard {
+            settings.javascript_access_clipboard = cef::State::DISABLED;
+            settings.javascript_dom_paste = cef::State::DISABLED;
         }
 
         let mut browser = None;
@@ -5273,7 +5776,7 @@ fn create_webview<T: UserEvent>(
                             Some(&url),
                             Some(&settings),
                             None,
-                            None,
+                            request_context.as_mut(),
                         );
                         if browser.is_some() {
                             if attempt > 0 {
@@ -5296,27 +5799,31 @@ fn create_webview<T: UserEvent>(
         }
 
         if browser.is_none() {
-            if let Some(reason) = last_handle_error {
-                log::error!(
-                    "CEF browser creation failed ({}; bounds={}x{}+{},{}). window will appear blank",
-                    reason,
-                    cef_bounds.width,
-                    cef_bounds.height,
-                    cef_bounds.x,
-                    cef_bounds.y,
-                );
+            let message = if let Some(reason) = last_handle_error {
+                format!(
+                    "CEF browser creation failed ({reason}; bounds={}x{}+{},{}).",
+                    cef_bounds.width, cef_bounds.height, cef_bounds.x, cef_bounds.y
+                )
             } else {
-                log::error!(
-                    "CEF browser creation failed (bounds={}x{}+{},{}). window will appear blank",
-                    cef_bounds.width,
-                    cef_bounds.height,
-                    cef_bounds.x,
-                    cef_bounds.y,
-                );
-            }
+                format!(
+                    "CEF browser creation failed (bounds={}x{}+{},{}).",
+                    cef_bounds.width, cef_bounds.height, cef_bounds.x, cef_bounds.y
+                )
+            };
+
+            log::error!("{message}");
+            return Err(Error::CreateWebview(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                message,
+            ))));
+        }
+
+        if let Some(browser) = browser.as_ref() {
+            send_init_scripts_to_renderer(browser, initialization_scripts.as_ref());
         }
 
         browser_slot.set(browser);
+        let _ = move_resize_browser_child(window, &browser_slot, initial_rect);
         if !focused {
             if let Some(browser) = browser_slot.current() {
                 if let Some(host) = browser.host() {
@@ -5360,6 +5867,7 @@ fn create_webview<T: UserEvent>(
     Ok(WebviewWrapper {
         label,
         id,
+        _client: client,
         browser_slot,
         webview_event_listeners: Default::default(),
         background_color,

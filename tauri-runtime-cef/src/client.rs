@@ -1,5 +1,9 @@
 use crate::browser_slot::BrowserSlot;
 use cef::string::CefStringList;
+use cef::wrapper::message_router::{
+    BrowserSideCallback, BrowserSideHandler, BrowserSideRouter, MessageRouterBrowserSide,
+    MessageRouterBrowserSideHandlerCallbacks, MessageRouterConfig,
+};
 use cef::*;
 use http::header::CONTENT_TYPE;
 use std::{
@@ -117,6 +121,7 @@ pub struct RuntimeClientCallbacks {
 struct RuntimeClientState {
     browser_slot: BrowserSlot,
     callbacks: RuntimeClientCallbacks,
+    ipc_router: Arc<BrowserSideRouter>,
 }
 
 impl RuntimeClientState {
@@ -216,10 +221,73 @@ impl RuntimeClientBuilder {
     }
 
     pub fn build(self) -> Client {
-        RuntimeClient::new(Arc::new(RuntimeClientState {
+        let ipc_router = BrowserSideRouter::new(MessageRouterConfig::default());
+        let state = Arc::new(RuntimeClientState {
             browser_slot: self.browser_slot,
             callbacks: self.callbacks,
-        }))
+            ipc_router: ipc_router.clone(),
+        });
+
+        let _ = ipc_router.add_handler(
+            Arc::new(RuntimeIpcRouterHandler {
+                state: state.clone(),
+            }),
+            true,
+        );
+
+        RuntimeClient::new(state)
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeIpcRouterHandler {
+    state: Arc<RuntimeClientState>,
+}
+
+impl BrowserSideHandler for RuntimeIpcRouterHandler {
+    fn on_query_str(
+        &self,
+        browser: Option<Browser>,
+        frame: Option<Frame>,
+        _query_id: i64,
+        request: &str,
+        _persistent: bool,
+        callback: Arc<Mutex<dyn BrowserSideCallback>>,
+    ) -> bool {
+        let browser_id = browser
+            .as_ref()
+            .map(Browser::identifier)
+            .unwrap_or_default();
+
+        if let Some(current_browser) = self.state.browser_slot.current() {
+            if browser_id != 0 && current_browser.identifier() != browser_id {
+                return false;
+            }
+        }
+
+        let frame_url = frame
+            .as_ref()
+            .map(|frame| to_string(frame.url()))
+            .filter(|url| !url.is_empty());
+
+        let mut arguments = Vec::with_capacity(2);
+        if let Some(frame_url) = frame_url {
+            arguments.push(frame_url);
+        }
+        arguments.push(request.to_string());
+
+        self.state.emit(BrowserEvent::ProcessMessage {
+            browser_id,
+            source_process: ProcessId::RENDERER,
+            name: "__TAURI_IPC__".to_string(),
+            arguments,
+        });
+
+        if let Ok(callback) = callback.lock() {
+            callback.success_str("");
+        }
+
+        true
     }
 }
 
@@ -507,6 +575,19 @@ wrap_client! {
             source_process: ProcessId,
             message: Option<&mut ProcessMessage>,
         ) -> i32 {
+            let browser_clone = browser.as_ref().map(|browser| (*(*browser)).clone());
+            let frame_clone = message_frame.as_ref().map(|frame| (*(*frame)).clone());
+            let message_clone = message.as_ref().map(|message| (*(*message)).clone());
+
+            if self.state.ipc_router.on_process_message_received(
+                browser_clone,
+                frame_clone,
+                source_process,
+                message_clone,
+            ) {
+                return 1;
+            }
+
             let browser_id = browser_id(browser);
             let name = message
                 .as_ref()
@@ -537,18 +618,43 @@ wrap_request_handler! {
     impl RequestHandler {
         fn on_before_browse(
             &self,
-            _browser: Option<&mut Browser>,
-            _frame: Option<&mut Frame>,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
             request: Option<&mut Request>,
             _user_gesture: i32,
             _is_redirect: i32,
         ) -> i32 {
+            let browser_clone = browser.as_ref().map(|browser| (*(*browser)).clone());
+            let frame_clone = frame.as_ref().map(|frame| (*(*frame)).clone());
+            self.state
+                .ipc_router
+                .on_before_browse(browser_clone, frame_clone);
+
             let Some(handler) = &self.state.callbacks.on_before_browse else {
                 return 0;
             };
 
             let url = request.map_or_else(String::new, |request| to_string(request.url()));
             i32::from(!handler(&url))
+        }
+
+        fn on_render_process_terminated(
+            &self,
+            browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: i32,
+            error_string: Option<&CefString>,
+        ) {
+            self.state
+                .ipc_router
+                .on_render_process_terminated(browser.cloned());
+
+            log::error!(
+                "cef renderer terminated status={:?} code={} message='{}'",
+                status,
+                error_code,
+                cef_string(error_string)
+            );
         }
 
         fn on_open_urlfrom_tab(
@@ -600,6 +706,16 @@ wrap_resource_request_handler! {
     }
 
     impl ResourceRequestHandler {
+        fn on_before_resource_load(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _callback: Option<&mut Callback>,
+        ) -> ReturnValue {
+            ReturnValue::CONTINUE
+        }
+
         fn resource_handler(
             &self,
             _browser: Option<&mut Browser>,
@@ -754,6 +870,9 @@ wrap_life_span_handler! {
         }
 
         fn on_before_close(&self, browser: Option<&mut cef::Browser>) {
+            let browser_clone = browser.as_ref().map(|browser| (*(*browser)).clone());
+            self.state.ipc_router.on_before_close(browser_clone);
+
             let browser_id = browser_id(browser);
 
             if let Some(current_browser) = self.state.browser_slot.current() {
@@ -819,6 +938,26 @@ wrap_load_handler! {
                 url: frame_url(frame),
                 http_status_code,
             });
+        }
+
+        fn on_load_error(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            frame: Option<&mut Frame>,
+            error_code: Errorcode,
+            error_text: Option<&CefString>,
+            failed_url: Option<&CefString>,
+        ) {
+            if frame.as_ref().is_some_and(|frame| frame.is_main() == 0) {
+                return;
+            }
+
+            log::error!(
+                "cef load error code={:?} text='{}' url='{}'",
+                error_code,
+                cef_string(error_text),
+                cef_string(failed_url)
+            );
         }
     }
 }
