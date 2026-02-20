@@ -5001,19 +5001,27 @@ fn handle_event_loop<T: UserEvent>(
                             for webview in webviews {
                                 #[cfg(feature = "wayland-osr")]
                                 if let Some(state_arc) = &webview.osr_state {
-                                    // Update the OSR state size and notify CEF.
-                                    // view_rect is in logical (DIP) pixels.
+                                    // Update the OSR state size and notify CEF only when the
+                                    // logical size actually changed.  Calling was_resized() on
+                                    // every Resized event creates a feedback loop: was_resized()
+                                    // → on_paint → present() → wl_surface.commit() → Resized.
                                     let sf = window.scale_factor();
                                     let phys = window.inner_size();
                                     let log: tao::dpi::LogicalSize<f64> = phys.to_logical(sf);
-                                    let w = log.width.round() as i32;
-                                    let h = log.height.round() as i32;
-                                    if let Ok(mut state) = state_arc.lock() {
-                                        state.resize(w, h, sf);
-                                    }
-                                    if let Some(browser) = webview.browser_slot.current() {
-                                        if let Some(host) = browser.host() {
-                                            host.was_resized();
+                                    let new_w = log.width.round() as i32;
+                                    let new_h = log.height.round() as i32;
+                                    let size_changed = state_arc
+                                        .lock()
+                                        .map(|s| s.logical_size != (new_w, new_h))
+                                        .unwrap_or(false);
+                                    if size_changed {
+                                        if let Ok(mut state) = state_arc.lock() {
+                                            state.resize(new_w, new_h, sf);
+                                        }
+                                        if let Some(browser) = webview.browser_slot.current() {
+                                            if let Some(host) = browser.host() {
+                                                host.was_resized();
+                                            }
                                         }
                                     }
                                     continue;
@@ -6145,7 +6153,31 @@ fn create_webview<T: UserEvent>(
             let _ = move_resize_browser_child(window, &browser_slot, initial_rect);
         }
 
+        // For OSR browsers, CEF starts internally unfocused — we must explicitly
+        // grant focus.  For windowed browsers the OS handles this automatically.
+        #[cfg(feature = "wayland-osr")]
+        if is_wayland {
+            if let Some(browser) = browser_slot.current() {
+                if let Some(host) = browser.host() {
+                    if focused {
+                        host.set_focus(1);
+                    } else {
+                        host.set_focus(0);
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "wayland-osr"))]
         if !focused {
+            if let Some(browser) = browser_slot.current() {
+                if let Some(host) = browser.host() {
+                    host.set_focus(0);
+                }
+            }
+        }
+        // Keep the non-OSR path working when wayland-osr is enabled.
+        #[cfg(feature = "wayland-osr")]
+        if !is_wayland && !focused {
             if let Some(browser) = browser_slot.current() {
                 if let Some(host) = browser.host() {
                     host.set_focus(0);
