@@ -78,7 +78,7 @@ use crate::browser_slot::BrowserSlot;
 use crate::client::PopupRequestFeatures;
 use crate::client::{BrowserEvent, ResourceRequestPayload, RuntimeClientBuilder};
 #[cfg(feature = "tao-runtime")]
-use crate::tao_window::HostWindowInfo;
+use crate::tao_window::{cef_null_window_handle, cef_window_handle_is_null, HostWindowInfo};
 use cef::rc::Rc;
 use cef::{
     browser_host_create_browser_sync, cookie_manager_get_global_manager, dictionary_value_create,
@@ -6066,7 +6066,7 @@ fn create_webview<T: UserEvent>(
 
         if is_wayland {
             // OSR path: windowless browser, no X11 parent needed.
-            let window_info = WindowInfo::default().set_as_windowless(0);
+            let window_info = WindowInfo::default().set_as_windowless(cef_null_window_handle());
             browser = browser_host_create_browser_sync(
                 Some(&window_info),
                 Some(&mut client),
@@ -6090,7 +6090,7 @@ fn create_webview<T: UserEvent>(
             for attempt in 0..=30 {
                 match HostWindowInfo::from_tao_window(window) {
                     Ok(host_window) => {
-                        if host_window.parent_handle == 0 {
+                        if cef_window_handle_is_null(host_window.parent_handle) {
                             last_handle_error = Some("got null parent window handle".to_string());
                         } else {
                             let window_info = WindowInfo::default()

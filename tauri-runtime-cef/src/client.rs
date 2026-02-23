@@ -12,6 +12,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(target_os = "linux")]
+type NativeEvent = cef::sys::XEvent;
+#[cfg(target_os = "windows")]
+type NativeEvent = cef::sys::MSG;
+
 pub type BrowserEventHandler = Arc<dyn Fn(BrowserEvent) + Send + Sync + 'static>;
 pub type BeforeBrowseHandler = Arc<dyn Fn(&str) -> bool + Send + Sync + 'static>;
 pub type OpenUrlFromTabHandler = Arc<dyn Fn(&str) -> bool + Send + Sync + 'static>;
@@ -1042,7 +1047,7 @@ wrap_jsdialog_handler! {
             self.state.emit(BrowserEvent::JsDialog {
                 browser_id: browser_id(browser),
                 origin_url: cef_string(origin_url),
-                dialog_type: dialog_type.get_raw(),
+                dialog_type: dialog_type.get_raw() as u32,
                 message: cef_string(message_text),
                 default_prompt: cef_string(default_prompt_text),
             });
@@ -1087,7 +1092,7 @@ wrap_dialog_handler! {
         ) -> i32 {
             self.state.emit(BrowserEvent::FileDialog {
                 browser_id: browser_id(browser),
-                mode: mode.get_raw(),
+                mode: mode.get_raw() as u32,
                 title: cef_string(title),
                 default_file_path: cef_string(default_file_path),
                 accept_filters: cef_string_list(accept_filters),
@@ -1176,7 +1181,7 @@ wrap_keyboard_handler! {
             &self,
             _browser: Option<&mut Browser>,
             _event: Option<&KeyEvent>,
-            _os_event: Option<&mut cef::sys::XEvent>,
+            _os_event: Option<&mut NativeEvent>,
             _is_keyboard_shortcut: Option<&mut i32>,
         ) -> i32 {
             0
@@ -1186,7 +1191,7 @@ wrap_keyboard_handler! {
             &self,
             _browser: Option<&mut Browser>,
             _event: Option<&KeyEvent>,
-            _os_event: Option<&mut cef::sys::XEvent>,
+            _os_event: Option<&mut NativeEvent>,
         ) -> i32 {
             0
         }

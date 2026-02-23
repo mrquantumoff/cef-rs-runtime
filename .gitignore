@@ -12,3 +12,5 @@ Cargo.lock
 
 .gemini/
 gha-creds-*.json
+
+_codex_tmp/
